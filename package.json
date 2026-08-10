@@ -1,0 +1,44 @@
+{
+  "name": "theta-theme-cafe",
+  "version": "0.1.0",
+  "description": "A small Theta theme for a cafe or restaurant site. Written from scratch to demonstrate the theme-authoring workflow end to end.",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./assets/*": "./dist/*"
+  },
+  "scripts": {
+    "build": "vite build && npm run test:contract",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:contract": "vitest run test/registration-contract.test.ts",
+    "watch": "vite build --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.17",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "jsdom": "^29.1.1",
+    "lucide-react": "^0.553.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^3.4.0",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.0.0",
+    "vite": "^7.2.2",
+    "vitest": "^4.1.9"
+  },
+  "peerDependencies": {
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.553.0",
+    "react": "^19",
+    "react-dom": "^19",
+    "tailwind-merge": "^3.4.0"
+  }
+}
