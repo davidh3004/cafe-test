@@ -1,0 +1,970 @@
+# theta-workflow-version: 1.7.2
+# Theme Site Deployment Workflow
+#
+# This workflow expects the theme repository (source branch checked out to theme-source/)
+# to have:
+#   - A package.json with at least one build script: build:theme, build:bundle, or build
+#   - The build must output the bundle to dist/theme.bundle.js
+# See THEME_DEVELOPMENT.md for theme repository requirements and example package.json scripts.
+#
+# 1.6.0 (17-09, PERF-01): a theme may serve its font faces as separate files from a
+# `dist/fonts` directory rather than embedding them in its stylesheet — embedding is
+# Vite's documented library-mode behaviour (build.assetsInlineLimit is ignored when
+# build.lib is set, so assets are always inlined regardless of size), not a choice
+# every theme author makes. A stylesheet that references external font files the
+# pipeline does not carry to the deployed root would 404 every face, so this version
+# carries an optional `dist/fonts` -> `public/fonts` copy at each of the three
+# artifact-copy sites below, guarded on the directory existing so a theme that still
+# embeds its fonts is byte-unaffected.
+
+name: Deploy Theme Site
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!**-build'  # Build branches are deployed via workflow_dispatch only
+    paths-ignore:
+      # The platform WRITES this file to the source branch before dispatching a
+      # deploy (copy-template/route.ts and deploy/route.ts both call
+      # copyWorkflowFile). Without this ignore, each of those writes is a push to
+      # a matched branch and self-triggers a deploy run — so one redeploy fired
+      # three concurrent runs: two from the workflow-file commits, one from the
+      # actual workflow_dispatch. The sync is preparation for a deploy, not a
+      # reason to start one; deploys are always dispatched explicitly.
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      theme_id:
+        description: 'Theme ID from Strapi'
+        required: true
+        type: string
+      strapi_graphql_url:
+        description: 'Strapi GraphQL URL (e.g., https://theta-strapi.ngrok.app/graphql)'
+        required: true
+        type: string
+      strapi_access_token:
+        description: 'Strapi Access Token'
+        required: true
+        type: string
+      theme_bundle_url:
+        description: 'Theme Bundle URL (optional if skip_bundle_build is false and theme repo has build scripts)'
+        required: false
+        type: string
+      theme_name:
+        description: 'Theme Name'
+        required: true
+        type: string
+      vercel_token:
+        description: 'Vercel API Token'
+        required: true
+        type: string
+      vercel_team_id:
+        description: 'Vercel Team ID (optional)'
+        required: false
+        type: string
+      vercel_project_id:
+        description: 'Platform Vercel project id (theta-<teamId>-<themeId>) the deploy must target'
+        required: false
+        type: string
+      subdomain:
+        description: 'Subdomain for deployment'
+        required: true
+        type: string
+      skip_bundle_build:
+        description: 'Skip building bundle from source (use when bundle URL is provided or already on build branch)'
+        required: false
+        type: boolean
+        default: false
+      callback_url:
+        description: 'Tenant-scoped URL to POST deploy status on completion — /api/deploy/<teamId>/<themeId>/status (supplied by the deploy route; optional)'
+        required: false
+        type: string
+      callback_token:
+        description: 'Bearer HMAC token binding (teamId,themeId,deploymentId) for authenticating the callback (optional)'
+        required: false
+        type: string
+
+# Serialize deploys of the same site. paths-ignore above removes the usual cause
+# of concurrent runs, but genuine overlap is still possible (two people, or a
+# push landing next to a dispatch), and two runs deploying one tenant race each
+# other to the same Vercel project.
+#
+# cancel-in-progress is deliberately FALSE. A run that is killed mid-flight never
+# POSTs its status callback, which strands that deployment in `building` in the
+# platform's deployment-state machine. Queueing costs a few CI minutes; cancelling
+# costs a stuck deployment row and a confused dashboard.
+concurrency:
+  group: deploy-theme-site-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Determine branch type
+        id: branch-type
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          if [[ "$BRANCH" == *"-build" ]]; then
+            echo "branch_type=build" >> $GITHUB_OUTPUT
+            echo "source_branch=${BRANCH%-build}" >> $GITHUB_OUTPUT
+            echo "build_branch=$BRANCH" >> $GITHUB_OUTPUT
+          else
+            echo "branch_type=source" >> $GITHUB_OUTPUT
+            echo "source_branch=$BRANCH" >> $GITHUB_OUTPUT
+            echo "build_branch=${BRANCH}-build" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout source branch for theme build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch-type.outputs.source_branch }}
+          path: theme-source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Validate theme repository
+        id: validate-theme
+        if: github.event.inputs.skip_bundle_build != 'true'
+        working-directory: theme-source
+        run: |
+          echo "=== Validating Theme Repository ==="
+          if [ ! -f "package.json" ]; then
+            echo "::error::Theme repository must contain package.json. Add a package.json with at least one build script (build:theme, build:bundle, or build) that outputs dist/theme.bundle.js. See THEME_DEVELOPMENT.md for requirements."
+            exit 1
+          fi
+          HAS_BUILD_SCRIPT=false
+          if grep -q '"build:theme"' package.json || grep -q '"build:bundle"' package.json || grep -q '"build"' package.json; then
+            HAS_BUILD_SCRIPT=true
+          fi
+          if [ "$HAS_BUILD_SCRIPT" != "true" ]; then
+            echo "::error::package.json must define at least one of: build:theme, build:bundle, or build. The script must output dist/theme.bundle.js. See THEME_DEVELOPMENT.md for example."
+            exit 1
+          fi
+          if [ -f "theta.config.json" ]; then
+            echo "✓ theta.config.json found (recommended)"
+          else
+            echo "⚠ theta.config.json not found (optional but recommended)"
+          fi
+          echo "✓ Theme repository structure validated"
+          echo "================================"
+
+      - name: Configure git for private dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}@github.com/".insteadOf "git@github.com:"
+
+      - name: Build theme bundle
+        id: build-theme
+        if: github.event.inputs.skip_bundle_build != 'true'
+        working-directory: theme-source
+        env:
+          # THEME-01: the bundle must register on window.__THETA_THEMES__ under the
+          # SAME name the deployed site looks it up by (NEXT_PUBLIC_THEME_NAME, set
+          # below from this same value). The theme's vite.config bakes
+          # __THEME_NAME__ from process.env.THEME_NAME ?? pkg.name, so passing it
+          # here guarantees registration name == lookup name for any theme,
+          # regardless of the theme's package.json name.
+          THEME_NAME: ${{ github.event.inputs.theme_name || github.event.repository.name }}
+        run: |
+          echo "=== Build Theme Bundle ==="
+          if [ ! -f "package.json" ]; then
+            echo "::error::package.json not found in theme-source/. Run the 'Validate theme repository' step first. Failing early."
+            exit 1
+          fi
+          BUILD_SCRIPTS=""
+          grep -E '"(build:theme|build:bundle|build)"' package.json || true
+          echo "Installing theme dependencies..."
+          if [ -f "package-lock.json" ]; then
+            npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+          else
+            npm install --legacy-peer-deps
+          fi
+          BUILD_CMD=""
+          if npm run build:theme 2>/dev/null; then
+            BUILD_CMD="npm run build:theme"
+          elif npm run build 2>/dev/null; then
+            BUILD_CMD="npm run build"
+          elif npm run build:bundle 2>/dev/null; then
+            BUILD_CMD="npm run build:bundle"
+          else
+            echo "::error::No executable build script found. Define one of build:theme, build, or build:bundle in package.json that produces dist/theme.bundle.js. See THEME_DEVELOPMENT.md."
+            exit 1
+          fi
+          echo "✓ Built with: $BUILD_CMD"
+          echo "bundle_build_cmd=$BUILD_CMD" >> $GITHUB_OUTPUT
+          echo "Listing dist/ and build/ after build:"
+          ls -la dist/ 2>/dev/null || echo "dist/ missing or empty"
+          ls -la build/ 2>/dev/null || echo "build/ missing or empty"
+          BUNDLE_FILE=""
+          if [ -f "dist/theme.bundle.js" ]; then
+            BUNDLE_FILE="dist/theme.bundle.js"
+          else
+            for f in dist/*.bundle.js; do [ -f "$f" ] && { BUNDLE_FILE="$f"; break; }; done
+            if [ -z "$BUNDLE_FILE" ]; then
+              for f in build/*.bundle.js; do [ -f "$f" ] && { BUNDLE_FILE="$f"; break; }; done
+            fi
+          fi
+          if [ -z "$BUNDLE_FILE" ]; then
+            echo "::error::Build did not produce the expected bundle. Accept only: dist/theme.bundle.js, dist/*.bundle.js, or build/*.bundle.js. Check your build script output. See THEME_DEVELOPMENT.md."
+            exit 1
+          fi
+          echo "bundle_file=$BUNDLE_FILE" >> $GITHUB_OUTPUT
+          echo "bundle_found=true" >> $GITHUB_OUTPUT
+          BUNDLE_SIZE=$(wc -c < "$BUNDLE_FILE" || echo "0")
+          echo "bundle_size=$BUNDLE_SIZE" >> $GITHUB_OUTPUT
+          echo "✓ Bundle found: $BUNDLE_FILE (size: $BUNDLE_SIZE bytes)"
+          ls -lh "$BUNDLE_FILE"
+          # Theme CSS (optional): dist/theme.bundle.css or dist/*.bundle.css
+          CSS_FILE=""
+          if [ -f "dist/theme.bundle.css" ]; then
+            CSS_FILE="dist/theme.bundle.css"
+          else
+            for f in dist/*.bundle.css; do [ -f "$f" ] && { CSS_FILE="$f"; break; }; done
+            if [ -z "$CSS_FILE" ]; then
+              for f in build/*.bundle.css; do [ -f "$f" ] && { CSS_FILE="$f"; break; }; done
+            fi
+          fi
+          if [ -n "$CSS_FILE" ]; then
+            echo "css_file=$CSS_FILE" >> $GITHUB_OUTPUT
+            echo "css_found=true" >> $GITHUB_OUTPUT
+            echo "✓ Theme CSS found: $CSS_FILE"
+            ls -lh "$CSS_FILE"
+          else
+            echo "css_found=false" >> $GITHUB_OUTPUT
+            echo "No theme CSS file found (optional)"
+          fi
+          # Phase 11 Plan 05: deferred CSS chunk (theme.bundle.deferred.css),
+          # emitted alongside the critical CSS by the css-split Vite plugin. It
+          # is the sibling of $CSS_FILE with `.deferred.css` in place of `.css`.
+          # The live theme-site derives its URL as bundle `.js` -> `.deferred.css`
+          # (resolveLiveBundle), so it MUST be served next to the bundle or the
+          # deferred <link> 404s and below-the-fold styles never load. Optional:
+          # a theme built without the split simply has no deferred file.
+          DEFERRED_CSS_FILE=""
+          if [ -n "$CSS_FILE" ]; then
+            CAND="${CSS_FILE%.css}.deferred.css"
+            [ -f "$CAND" ] && DEFERRED_CSS_FILE="$CAND"
+          fi
+          if [ -n "$DEFERRED_CSS_FILE" ]; then
+            echo "deferred_css_file=$DEFERRED_CSS_FILE" >> $GITHUB_OUTPUT
+            echo "deferred_css_found=true" >> $GITHUB_OUTPUT
+            echo "✓ Deferred theme CSS found: $DEFERRED_CSS_FILE"
+            ls -lh "$DEFERRED_CSS_FILE"
+          else
+            echo "deferred_css_found=false" >> $GITHUB_OUTPUT
+            echo "No deferred theme CSS file found (optional; theme not css-split)"
+          fi
+          echo "================================"
+
+      - name: Validate workflow inputs (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          SKIP="${{ github.event.inputs.skip_bundle_build }}"
+          URL="${{ github.event.inputs.theme_bundle_url }}"
+          if [ "$SKIP" = "true" ] && [ -z "$URL" ]; then
+            echo "::error::Either provide theme_bundle_url or set skip_bundle_build to false so the workflow can build the bundle from the theme repository."
+            exit 1
+          fi
+          echo "✓ Workflow inputs valid (bundle will be built or URL provided)"
+
+      - name: Copy theme bundle to build branch (for source branch pushes)
+        if: steps.branch-type.outputs.branch_type == 'source' && steps.build-theme.outputs.bundle_found == 'true'
+        run: |
+          echo "=== Copy Theme Bundle to Build Branch (source push) ==="
+          BUNDLE_FILE="${{ steps.build-theme.outputs.bundle_file }}"
+          BUILD_BRANCH="${{ steps.branch-type.outputs.build_branch }}"
+          echo "Bundle file: $BUNDLE_FILE -> build branch: $BUILD_BRANCH"
+          if [ ! -f "theme-source/$BUNDLE_FILE" ]; then
+            echo "::error::Bundle file not found at theme-source/$BUNDLE_FILE. Build step must produce the bundle before copy."
+            exit 1
+          fi
+          git fetch origin "$BUILD_BRANCH" 2>/dev/null || true
+          if git ls-remote --heads origin "$BUILD_BRANCH" | grep -q "$BUILD_BRANCH"; then
+            git checkout "$BUILD_BRANCH"
+            git pull origin "$BUILD_BRANCH" || true
+          else
+            git checkout -b "$BUILD_BRANCH"
+          fi
+          mkdir -p dist public
+          cp "theme-source/$BUNDLE_FILE" dist/theme.bundle.js || cp "theme-source/$BUNDLE_FILE" dist/
+          if [ ! -f "dist/theme.bundle.js" ]; then
+            echo "::error::Failed to copy bundle to dist/theme.bundle.js."
+            exit 1
+          fi
+          cp dist/theme.bundle.js public/theme.bundle.js
+          echo "✓ Bundle copied to dist/theme.bundle.js and public/theme.bundle.js"
+          ls -lh dist/theme.bundle.js public/theme.bundle.js
+          GIT_ADD="dist/theme.bundle.js public/theme.bundle.js"
+          if [ "${{ steps.build-theme.outputs.css_found }}" = "true" ]; then
+            CSS_FILE="${{ steps.build-theme.outputs.css_file }}"
+            cp "theme-source/$CSS_FILE" dist/theme.bundle.css 2>/dev/null || cp "theme-source/$CSS_FILE" dist/
+            cp dist/theme.bundle.css public/theme.bundle.css
+            echo "✓ Theme CSS copied to dist/theme.bundle.css and public/theme.bundle.css"
+            ls -lh dist/theme.bundle.css public/theme.bundle.css
+            GIT_ADD="$GIT_ADD dist/theme.bundle.css public/theme.bundle.css"
+          fi
+          # Phase 11 Plan 05: carry the deferred CSS onto the build branch too.
+          if [ "${{ steps.build-theme.outputs.deferred_css_found }}" = "true" ]; then
+            DEFERRED_CSS_FILE="${{ steps.build-theme.outputs.deferred_css_file }}"
+            cp "theme-source/$DEFERRED_CSS_FILE" dist/theme.bundle.deferred.css 2>/dev/null || cp "theme-source/$DEFERRED_CSS_FILE" dist/
+            cp dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+            echo "✓ Deferred theme CSS copied to dist/ and public/theme.bundle.deferred.css"
+            ls -lh dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+            GIT_ADD="$GIT_ADD dist/theme.bundle.deferred.css public/theme.bundle.deferred.css"
+          fi
+          # PERF-01 (17-09): optional font directory, present only when the theme
+          # serves its faces as separate files rather than embedding them. Guarded
+          # on the directory existing so a theme with no such directory is unaffected.
+          if [ -d "theme-source/dist/fonts" ]; then
+            mkdir -p dist/fonts public/fonts
+            cp -R theme-source/dist/fonts/. dist/fonts/
+            cp -R theme-source/dist/fonts/. public/fonts/
+            FONT_COUNT=$(find dist/fonts -type f | wc -l | tr -d ' ')
+            echo "✓ Font directory copied to dist/fonts and public/fonts ($FONT_COUNT files)"
+            ls -lh dist/fonts public/fonts
+            GIT_ADD="$GIT_ADD dist/fonts public/fonts"
+          else
+            echo "No theme-source/dist/fonts directory (theme embeds fonts in its stylesheet; optional)"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist/theme.bundle.js public/theme.bundle.js
+          if [ "${{ steps.build-theme.outputs.css_found }}" = "true" ]; then
+            git add -f dist/theme.bundle.css public/theme.bundle.css
+          fi
+          if [ "${{ steps.build-theme.outputs.deferred_css_found }}" = "true" ]; then
+            git add -f dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+          fi
+          if [ -d "dist/fonts" ]; then
+            git add -f dist/fonts public/fonts
+          fi
+          git status --short
+          if ! git diff --staged --quiet; then
+            git commit -m "Update theme bundle from ${{ steps.branch-type.outputs.source_branch }}"
+            git push origin "$BUILD_BRANCH" || { echo "::error::Push to $BUILD_BRANCH failed."; exit 1; }
+            echo "✓ Bundle committed and pushed to $BUILD_BRANCH"
+          else
+            echo "✓ No bundle changes (already up to date)"
+          fi
+          if ! git ls-tree HEAD dist/theme.bundle.js >/dev/null 2>&1; then
+            echo "::error::dist/theme.bundle.js is not tracked on HEAD. Bundle copy verification failed."
+            exit 1
+          fi
+          if ! git ls-tree HEAD public/theme.bundle.js >/dev/null 2>&1; then
+            echo "::error::public/theme.bundle.js is not tracked on HEAD. Bundle copy verification failed."
+            exit 1
+          fi
+          echo "✓ Bundle copy verification passed"
+          echo "================================"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy theme bundle to build branch (for build branch pushes)
+        if: steps.branch-type.outputs.branch_type == 'build' && steps.build-theme.outputs.bundle_found == 'true'
+        run: |
+          echo "=== Copy Theme Bundle to Build Branch (on build branch) ==="
+          BUNDLE_FILE="${{ steps.build-theme.outputs.bundle_file }}"
+          echo "Bundle file: $BUNDLE_FILE"
+          if [ ! -f "theme-source/$BUNDLE_FILE" ]; then
+            echo "::error::Bundle file not found at theme-source/$BUNDLE_FILE."
+            exit 1
+          fi
+          mkdir -p dist public
+          cp "theme-source/$BUNDLE_FILE" dist/theme.bundle.js || cp "theme-source/$BUNDLE_FILE" dist/
+          if [ ! -f "dist/theme.bundle.js" ]; then
+            echo "::error::Failed to copy bundle to dist/theme.bundle.js."
+            exit 1
+          fi
+          cp dist/theme.bundle.js public/theme.bundle.js
+          echo "✓ Bundle copied to dist/theme.bundle.js and public/theme.bundle.js"
+          ls -lh dist/theme.bundle.js public/theme.bundle.js
+          GIT_ADD="dist/theme.bundle.js public/theme.bundle.js"
+          if [ "${{ steps.build-theme.outputs.css_found }}" = "true" ]; then
+            CSS_FILE="${{ steps.build-theme.outputs.css_file }}"
+            cp "theme-source/$CSS_FILE" dist/theme.bundle.css 2>/dev/null || cp "theme-source/$CSS_FILE" dist/
+            cp dist/theme.bundle.css public/theme.bundle.css
+            echo "✓ Theme CSS copied to dist/theme.bundle.css and public/theme.bundle.css"
+            ls -lh dist/theme.bundle.css public/theme.bundle.css
+            GIT_ADD="$GIT_ADD dist/theme.bundle.css public/theme.bundle.css"
+          fi
+          # Phase 11 Plan 05: carry the deferred CSS onto the build branch too.
+          if [ "${{ steps.build-theme.outputs.deferred_css_found }}" = "true" ]; then
+            DEFERRED_CSS_FILE="${{ steps.build-theme.outputs.deferred_css_file }}"
+            cp "theme-source/$DEFERRED_CSS_FILE" dist/theme.bundle.deferred.css 2>/dev/null || cp "theme-source/$DEFERRED_CSS_FILE" dist/
+            cp dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+            echo "✓ Deferred theme CSS copied to dist/ and public/theme.bundle.deferred.css"
+            ls -lh dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+            GIT_ADD="$GIT_ADD dist/theme.bundle.deferred.css public/theme.bundle.deferred.css"
+          fi
+          # PERF-01 (17-09): optional font directory, present only when the theme
+          # serves its faces as separate files rather than embedding them. Guarded
+          # on the directory existing so a theme with no such directory is unaffected.
+          if [ -d "theme-source/dist/fonts" ]; then
+            mkdir -p dist/fonts public/fonts
+            cp -R theme-source/dist/fonts/. dist/fonts/
+            cp -R theme-source/dist/fonts/. public/fonts/
+            FONT_COUNT=$(find dist/fonts -type f | wc -l | tr -d ' ')
+            echo "✓ Font directory copied to dist/fonts and public/fonts ($FONT_COUNT files)"
+            ls -lh dist/fonts public/fonts
+            GIT_ADD="$GIT_ADD dist/fonts public/fonts"
+          else
+            echo "No theme-source/dist/fonts directory (theme embeds fonts in its stylesheet; optional)"
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist/theme.bundle.js public/theme.bundle.js
+          if [ "${{ steps.build-theme.outputs.css_found }}" = "true" ]; then
+            git add -f dist/theme.bundle.css public/theme.bundle.css
+          fi
+          if [ "${{ steps.build-theme.outputs.deferred_css_found }}" = "true" ]; then
+            git add -f dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+          fi
+          if [ -d "dist/fonts" ]; then
+            git add -f dist/fonts public/fonts
+          fi
+          git status --short
+          if ! git diff --staged --quiet; then
+            git commit -m "Update theme bundle from ${{ steps.branch-type.outputs.source_branch }}"
+            git push origin HEAD || { echo "::error::Push failed."; exit 1; }
+            echo "✓ Bundle committed and pushed"
+          else
+            echo "✓ No bundle changes (already up to date)"
+          fi
+          if ! git ls-tree HEAD dist/theme.bundle.js >/dev/null 2>&1; then
+            echo "::error::dist/theme.bundle.js is not tracked on HEAD. Bundle copy verification failed."
+            exit 1
+          fi
+          if ! git ls-tree HEAD public/theme.bundle.js >/dev/null 2>&1; then
+            echo "::error::public/theme.bundle.js is not tracked on HEAD. Bundle copy verification failed."
+            exit 1
+          fi
+          echo "✓ Bundle copy verification passed"
+          echo "================================"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout build branch (for deployment)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch-type.outputs.build_branch }}
+          fetch-depth: 0
+
+      - name: Pull latest and verify bundle in working directory
+        run: |
+          echo "=== Ensure Working Directory Has Latest Build Branch ==="
+          git pull origin ${{ steps.branch-type.outputs.build_branch }} || true
+          echo "Current commit: $(git rev-parse HEAD)"
+          git log --oneline -5
+          echo "Checking for dist/theme.bundle.js..."
+          if [ -f "dist/theme.bundle.js" ]; then
+            echo "✓ dist/theme.bundle.js exists in working directory"
+            ls -lh dist/theme.bundle.js
+            file dist/theme.bundle.js
+          else
+            echo "Contents of dist/:"
+            ls -la dist/ 2>/dev/null || echo "dist/ missing"
+            if [ "${{ steps.build-theme.outputs.bundle_found }}" = "true" ] && [ "${{ github.event.inputs.theme_bundle_url }}" = "" ]; then
+              echo "::error::dist/theme.bundle.js is missing after checkout. The bundle was built but is not present on the build branch. Ensure the 'Copy theme bundle' step completed and pushed successfully."
+              exit 1
+            fi
+            echo "⚠ dist/theme.bundle.js not found (may be ok if using provided theme_bundle_url)"
+          fi
+          echo "================================"
+
+      - name: Ensure public/theme.bundle.js and theme.bundle.css for same-origin serving
+        run: |
+          echo "=== Ensure public/theme.bundle.js and theme.bundle.css exist (served with correct MIME type) ==="
+          mkdir -p public
+          if [ -f "dist/theme.bundle.js" ]; then
+            cp dist/theme.bundle.js public/theme.bundle.js
+            echo "✓ public/theme.bundle.js ready (copied from dist/)"
+            ls -lh public/theme.bundle.js
+          else
+            echo "⚠ dist/theme.bundle.js not found; public/ may be from build branch"
+            ls -la public/ 2>/dev/null || echo "public/ missing"
+          fi
+          if [ -f "dist/theme.bundle.css" ]; then
+            cp dist/theme.bundle.css public/theme.bundle.css
+            echo "✓ public/theme.bundle.css ready (copied from dist/)"
+            ls -lh public/theme.bundle.css
+          else
+            echo "No dist/theme.bundle.css (theme CSS optional)"
+          fi
+          # Phase 11 Plan 05: same-origin serve the deferred CSS chunk too, so the
+          # live theme-site's deferred <link> (bundle .js -> .deferred.css) resolves.
+          if [ -f "dist/theme.bundle.deferred.css" ]; then
+            cp dist/theme.bundle.deferred.css public/theme.bundle.deferred.css
+            echo "✓ public/theme.bundle.deferred.css ready (copied from dist/)"
+            ls -lh public/theme.bundle.deferred.css
+          else
+            echo "No dist/theme.bundle.deferred.css (theme not css-split; optional)"
+          fi
+          # PERF-01 (17-09): this region runs after the build-branch checkout, so
+          # it is what guarantees the font directory is present in the directory
+          # the deploy step actually uploads, even when the copy regions above ran
+          # on an earlier commit or were skipped entirely.
+          if [ -d "dist/fonts" ]; then
+            mkdir -p public/fonts
+            cp -R dist/fonts/. public/fonts/
+            FONT_COUNT=$(find dist/fonts -type f | wc -l | tr -d ' ')
+            echo "✓ public/fonts ready (copied from dist/fonts, $FONT_COUNT files)"
+            ls -lh public/fonts
+          else
+            echo "No dist/fonts (theme embeds fonts in its stylesheet; optional)"
+          fi
+          echo "================================"
+
+      - name: Checkout source branch again for dependency merge
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch-type.outputs.source_branch }}
+          path: theme-source
+
+      - name: Merge dependencies from theme branch
+        if: hashFiles('theme-source/package.json') != ''
+        run: |
+          if [ -f "theme-source/package.json" ] && [ -f "package.json" ]; then
+            node << 'EOF'
+          const fs = require('fs');
+          
+          const templatePkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const themePkg = JSON.parse(fs.readFileSync('theme-source/package.json', 'utf8'));
+          
+          // Merge dependencies from theme branch into template
+          if (themePkg.dependencies) {
+            templatePkg.dependencies = {
+              ...templatePkg.dependencies,
+              ...themePkg.dependencies
+            };
+          }
+          
+          // Merge devDependencies from theme branch into template
+          if (themePkg.devDependencies) {
+            templatePkg.devDependencies = {
+              ...templatePkg.devDependencies,
+              ...themePkg.devDependencies
+            };
+          }
+          
+          // Write merged package.json
+          fs.writeFileSync('package.json', JSON.stringify(templatePkg, null, 2) + '\n');
+          console.log('Merged dependencies from theme branch');
+          EOF
+          else
+            echo "Skipping dependency merge: theme-source/package.json or package.json not found"
+          fi
+      - name: Setup Node.js for site build
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install site dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Check for existing bundle in dist folder
+        id: check-bundle
+        run: |
+          echo "Current branch: ${{ github.ref_name }}"
+          echo "Build branch: ${{ steps.branch-type.outputs.build_branch }}"
+          echo "Checking for bundle in dist/ folder..."
+          
+          if [ -f "dist/theme.bundle.js" ]; then
+            echo "bundle_exists=true" >> $GITHUB_OUTPUT
+            echo "✓ Found theme.bundle.js in dist/ folder"
+            ls -lh dist/theme.bundle.js
+            file dist/theme.bundle.js
+          else
+            echo "bundle_exists=false" >> $GITHUB_OUTPUT
+            echo "✗ No theme.bundle.js found in dist/ folder"
+            echo "Contents of dist/ folder:"
+            ls -la dist/ 2>/dev/null || echo "dist/ folder does not exist"
+            echo ""
+            echo "Searching for any .js files in the repository:"
+            find . -name "*.bundle.js" -o -name "theme*.js" | grep -v node_modules | head -10 || echo "No bundle files found"
+          fi
+          
+          # Also check if we're on the build branch and if bundle was copied in previous step
+          if [ "${{ steps.branch-type.outputs.branch_type }}" == "build" ]; then
+            echo "On build branch - bundle should have been copied in previous workflow run"
+          fi
+
+      - name: Determine theme bundle URL
+        id: bundle-url
+        run: |
+          echo "=== Determining Theme Bundle URL ==="
+          INPUT_URL="${{ github.event.inputs.theme_bundle_url }}"
+          echo "Workflow input theme_bundle_url: ${INPUT_URL:-'(empty)'}"
+          echo "Bundle found in build: ${{ steps.build-theme.outputs.bundle_found }}"
+          echo "Bundle file: ${{ steps.build-theme.outputs.bundle_file }}"
+          echo "Local dist/theme.bundle.js exists: $([ -f 'dist/theme.bundle.js' ] && echo 'YES' || echo 'NO')"
+          echo "THEME_BUNDLE_URL secret set: $([ -n '${{ secrets.THEME_BUNDLE_URL }}' ] && echo 'YES' || echo 'NO')"
+          echo ""
+
+          if [ -n "$INPUT_URL" ]; then
+            echo "bundle_url=$INPUT_URL" >> $GITHUB_OUTPUT
+            echo "✓ Using provided theme_bundle_url input"
+          elif [ "${{ secrets.THEME_BUNDLE_URL }}" != "" ]; then
+            echo "bundle_url=${{ secrets.THEME_BUNDLE_URL }}" >> $GITHUB_OUTPUT
+            echo "✓ Using THEME_BUNDLE_URL secret"
+          elif [ -f "dist/theme.bundle.js" ] || [ -f "public/theme.bundle.js" ]; then
+            # Serve bundle from same origin so browser gets application/javascript MIME type
+            echo "bundle_url=/theme.bundle.js" >> $GITHUB_OUTPUT
+            echo "✓ Using bundle from deployment (public/theme.bundle.js → /theme.bundle.js)"
+          else
+            echo "bundle_url=" >> $GITHUB_OUTPUT
+            echo "::error::No theme bundle URL available and dist/theme.bundle.js is not present."
+            echo ""
+            echo "Actionable steps:"
+            echo "  1. Ensure the theme repository has package.json with build:theme, build:bundle, or build (see THEME_DEVELOPMENT.md)."
+            echo "  2. Ensure the build step produced dist/theme.bundle.js and the 'Copy theme bundle' step ran and pushed."
+            echo "  3. Provide theme_bundle_url as a workflow_dispatch input, or set THEME_BUNDLE_URL repository secret."
+            echo ""
+            echo "Debug: bundle_found=${{ steps.build-theme.outputs.bundle_found }}, bundle_file=${{ steps.build-theme.outputs.bundle_file }}, local file=$([ -f 'dist/theme.bundle.js' ] && echo 'yes' || echo 'no')."
+            exit 1
+          fi
+          echo ""
+          echo "Final bundle_url: ${{ steps.bundle-url.outputs.bundle_url }}"
+          echo "================================"
+
+      - name: Fail if theme bundle URL is missing or invalid
+        run: |
+          BUNDLE_URL="${{ steps.bundle-url.outputs.bundle_url }}"
+          if [ -z "$BUNDLE_URL" ] || [ "$BUNDLE_URL" = "" ]; then
+            echo "::error::Theme bundle URL is empty. Refusing to proceed. Provide theme_bundle_url, set THEME_BUNDLE_URL secret, or ensure the theme repo builds and copies dist/theme.bundle.js (see THEME_DEVELOPMENT.md)."
+            exit 1
+          fi
+          echo "✓ Theme bundle URL is set and validation passed"
+
+      - name: Validate theme bundle URL
+        id: validate-bundle-url
+        run: |
+          BUNDLE_URL="${{ steps.bundle-url.outputs.bundle_url }}"
+          if [ -z "$BUNDLE_URL" ] || [ "$BUNDLE_URL" = "" ]; then
+            echo "ERROR: Theme bundle URL is not configured!"
+            echo "Refusing to proceed to prevent publishing a build without a theme bundle."
+            echo "Please ensure the theme bundle is built and available."
+            echo "is_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "Theme bundle URL configured: $BUNDLE_URL"
+          echo "is_valid=true" >> $GITHUB_OUTPUT
+
+          # Relative path (/theme.bundle.js) is served from same origin with correct MIME type; no HTTP check needed
+          if [ "${BUNDLE_URL#/}" != "$BUNDLE_URL" ]; then
+            if [ -f "public/theme.bundle.js" ] || [ -f "dist/theme.bundle.js" ]; then
+              echo "✓ Relative bundle path; file present (will be served from deployment)"
+              echo "is_accessible=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠ Relative path but public/theme.bundle.js not found in working dir (may exist after copy step)"
+              echo "is_accessible=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Absolute URL: verify accessible
+            echo "Verifying bundle URL is accessible..."
+            HTTP_CODE="000"
+            for attempt in 1 2 3; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BUNDLE_URL" || echo "000")
+              echo "Attempt $attempt: HTTP $HTTP_CODE"
+              if [ "$HTTP_CODE" = "200" ]; then
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Waiting 5s before retry..."
+                sleep 5
+              fi
+            done
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✓ Theme bundle URL is accessible (HTTP 200)"
+              echo "is_accessible=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_accessible=false" >> $GITHUB_OUTPUT
+              BUNDLE_BUILT_OR_PRESENT="${{ steps.build-theme.outputs.bundle_found }}"
+              if [ -f "dist/theme.bundle.js" ]; then
+                BUNDLE_BUILT_OR_PRESENT="true"
+              fi
+              if [ "$BUNDLE_BUILT_OR_PRESENT" = "true" ]; then
+                echo "::error::Theme bundle URL returned HTTP $HTTP_CODE (expected 200). Bundle was built or copied in this run; refusing to proceed."
+                exit 1
+              fi
+              echo "⚠ Warning: Theme bundle URL returned HTTP $HTTP_CODE (continuing)."
+            fi
+          fi
+
+      - name: Deployment summary (bundle and URL)
+        run: |
+          echo "=== Deployment Summary ==="
+          echo "Bundle built successfully: ${{ steps.build-theme.outputs.bundle_found || 'N/A (skip_bundle_build or step skipped)' }}"
+          echo "Bundle file: ${{ steps.build-theme.outputs.bundle_file || 'N/A' }}"
+          echo "Bundle size (bytes): ${{ steps.build-theme.outputs.bundle_size || 'N/A' }}"
+          echo "Bundle URL that will be used: ${{ steps.bundle-url.outputs.bundle_url }}"
+          echo "Bundle URL accessible (HTTP 200): ${{ steps.validate-bundle-url.outputs.is_accessible || 'N/A' }}"
+          echo "================================"
+
+      - name: Extract Strapi base URL
+        id: strapi-base-url
+        run: |
+          STRAPI_URL="${{ github.event.inputs.strapi_graphql_url || secrets.STRAPI_GRAPHQL_URL }}"
+          # Remove /graphql suffix if present to get base URL
+          STRAPI_BASE_URL=$(echo "$STRAPI_URL" | sed 's|/graphql$||')
+          echo "base_url=$STRAPI_BASE_URL" >> $GITHUB_OUTPUT
+
+      - name: Verify environment variables before build
+        run: |
+          echo "=== Environment Variables for Build ==="
+          echo "NEXT_PUBLIC_STRAPI_URL: ${{ steps.strapi-base-url.outputs.base_url }}"
+          echo "NEXT_PUBLIC_STRAPI_TOKEN: [REDACTED - $(echo '${{ github.event.inputs.strapi_access_token || secrets.STRAPI_ACCESS_TOKEN }}' | wc -c) chars]"
+          echo "NEXT_PUBLIC_THEME_BUNDLE_URL: ${{ steps.bundle-url.outputs.bundle_url }}"
+          echo "NEXT_PUBLIC_THEME_NAME: ${{ github.event.inputs.theme_name || github.event.repository.name }}"
+          echo "NEXT_PUBLIC_SITE_SUBDOMAIN: ${{ github.event.inputs.subdomain || github.event.repository.name }}"
+          echo "========================================"
+          
+          BUNDLE_URL="${{ steps.bundle-url.outputs.bundle_url }}"
+          if [ -z "$BUNDLE_URL" ] || [ "$BUNDLE_URL" = "" ]; then
+            echo ""
+            echo "❌ ERROR: NEXT_PUBLIC_THEME_BUNDLE_URL is empty!"
+            echo "Build will proceed but pages will show a configuration error."
+            echo ""
+            echo "Debugging information:"
+            echo "  1. Theme bundle was built: ${{ steps.build-theme.outputs.bundle_found }}"
+            echo "  2. Bundle file: ${{ steps.build-theme.outputs.bundle_file }}"
+            echo "  3. Bundle exists in dist/: ${{ steps.check-bundle.outputs.bundle_exists }}"
+            echo "  4. THEME_BUNDLE_URL secret is set: $([ -n '${{ secrets.THEME_BUNDLE_URL }}' ] && echo 'YES' || echo 'NO')"
+            echo "  5. Branch type: ${{ steps.branch-type.outputs.branch_type }}"
+            echo "  6. Build branch: ${{ steps.branch-type.outputs.build_branch }}"
+            echo ""
+            echo "⚠️  The build will continue, but the deployed site will show a configuration error."
+            echo "   Please fix the bundle URL issue before deploying to production."
+          else
+            echo ""
+            echo "✓ NEXT_PUBLIC_THEME_BUNDLE_URL is set: $BUNDLE_URL"
+            if [ "${{ steps.validate-bundle-url.outputs.is_accessible }}" = "true" ]; then
+              echo "✓ Bundle URL is accessible"
+            else
+              echo "⚠ Bundle URL may not be accessible yet (check validation step above)"
+            fi
+          fi
+
+      - name: Build Next.js app
+        if: steps.validate-bundle-url.outcome == 'success'
+        run: |
+          echo "Building Next.js app with environment variables..."
+          echo "NEXT_PUBLIC_THEME_BUNDLE_URL will be: ${{ steps.bundle-url.outputs.bundle_url }}"
+          
+          # Guard: fail the build when bundle_url is empty to avoid shipping a broken site
+          if [ -z "${{ steps.bundle-url.outputs.bundle_url }}" ] || [ "${{ steps.bundle-url.outputs.bundle_url }}" = "" ]; then
+            echo "❌ ERROR: NEXT_PUBLIC_THEME_BUNDLE_URL is empty. Refusing to build."
+            echo "This usually means:"
+            echo "  1. The theme bundle was not built"
+            echo "  2. The bundle was not committed to the build branch"
+            echo "  3. The THEME_BUNDLE_URL secret is not set"
+            exit 1
+          fi
+          
+          npm run build
+        env:
+          NEXT_PUBLIC_STRAPI_URL: ${{ steps.strapi-base-url.outputs.base_url }}
+          NEXT_PUBLIC_STRAPI_TOKEN: ${{ github.event.inputs.strapi_access_token || secrets.STRAPI_ACCESS_TOKEN }}
+          NEXT_PUBLIC_THEME_BUNDLE_URL: ${{ steps.bundle-url.outputs.bundle_url }}
+          NEXT_PUBLIC_THEME_NAME: ${{ github.event.inputs.theme_name || github.event.repository.name }}
+          NEXT_PUBLIC_SITE_SUBDOMAIN: ${{ github.event.inputs.subdomain || github.event.repository.name }}
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Verify build output
+        run: |
+          echo "Checking build output..."
+          if [ -d ".next" ]; then
+            echo "✓ .next directory exists"
+            ls -la .next/ | head -10
+          else
+            echo "✗ .next directory not found - build may have failed"
+            exit 1
+          fi
+          
+          # Check if standalone output exists
+          if [ -d ".next/standalone" ]; then
+            echo "✓ Standalone output exists"
+          else
+            echo "⚠ Standalone output not found (may be using different output mode)"
+          fi
+
+      - name: Deploy to Vercel
+        id: deploy-vercel
+        run: |
+          # Deploy the pre-built standalone output
+          # Note: Environment variables are already embedded in the build from the previous step
+          # Use --prebuilt flag if available to ensure Vercel uses our build
+          echo "Deploying to Vercel..."
+          # Echo the resolved project id (input-or-secret) so the run log shows which
+          # platform project was targeted. NEVER echo the vercel_token.
+          echo "Project ID: $VERCEL_PROJECT_ID"
+
+          # Capture what `vercel deploy` prints. Run the prebuilt path first; on
+          # failure fall back to a plain deploy.
+          #
+          # BOTH invocations MUST redirect stderr (2>&1). The CLI splits its output:
+          # the bare deployment URL goes to STDOUT, but the decorated status lines —
+          # including `▲ Aliased  <stable domain>` — go to STDERR. The alias parse
+          # below reads a stderr line, so an invocation without 2>&1 silently yields
+          # an empty alias while still looking healthy (the deployment URL parses
+          # fine from stdout). That is exactly what happened on run 31386891802:
+          # `--prebuilt` fails on every run here ("no prebuilt output found in
+          # .vercel/output"), so the fallback IS the real path, and it was dropping
+          # stderr. Do not remove either redirect.
+          #
+          # A parse failure leaves the value empty and the callback degrades
+          # (omitting the field) rather than failing the deploy.
+          DEPLOY_OUTPUT=""
+          if DEPLOY_OUTPUT=$(vercel deploy --prod \
+            --token=${{ github.event.inputs.vercel_token || secrets.VERCEL_TOKEN }} \
+            --yes \
+            --prebuilt 2>&1); then
+            echo "$DEPLOY_OUTPUT"
+          else
+            echo "$DEPLOY_OUTPUT"
+            echo "Prebuilt deploy failed; retrying without --prebuilt..."
+            DEPLOY_OUTPUT=$(vercel deploy --prod \
+              --token=${{ github.event.inputs.vercel_token || secrets.VERCEL_TOKEN }} \
+              --yes 2>&1)
+            echo "$DEPLOY_OUTPUT"
+          fi
+
+          # The CLI prints TWO different URLs and the distinction matters:
+          #
+          #   Production   https://<project>-<hash>.vercel.app   <- unique to THIS deploy
+          #   ▲ Aliased    https://<project>-<alias>.vercel.app  <- STABLE production domain
+          #
+          # `deployment_url` (the per-deploy URL) is the honest identity of this
+          # deployment and stays the deployment record's value. But the platform
+          # also stamps Strapi's `theme.builtAssetUrl` from the callback, and that
+          # value is baked into the NEXT deploy as NEXT_PUBLIC_THEME_BUNDLE_URL.
+          # Pinning it to a per-deploy host makes every deploy serve the PREVIOUS
+          # deploy's theme assets — one cycle behind, forever, never self-correcting.
+          # So capture the alias separately and let the receiver pin assets to it.
+          # (Phase 17 / plan 17-10: this is why a verified 394KB->63KB CSS
+          # reduction reached zero real visitors.)
+          #
+          # Strip ANSI escapes first — the CLI decorates these lines with cursor
+          # control sequences, so a naive grep matches the escape noise too.
+          CLEAN_OUTPUT=$(printf '%s' "$DEPLOY_OUTPUT" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g')
+
+          # Anchor to the `Production` label rather than taking the last URL in the
+          # output. Once stderr is captured (2>&1, required for the alias parse
+          # below), the final URL printed is the `▲ Aliased` one — so a bare
+          # `tail -n 1` silently returns the ALIAS here and collapses deploymentUrl
+          # and aliasUrl into the same value, costing the deployment record its
+          # per-deploy identity. The CLI redraws progress, so `Production` can
+          # appear more than once; take the last.
+          DEPLOY_URL=$(printf '%s' "$CLEAN_OUTPUT" \
+            | grep -Eo 'Production[[:space:]]+https://[a-zA-Z0-9._-]+' \
+            | grep -Eo 'https://[a-zA-Z0-9._-]+' \
+            | tail -n 1 || true)
+          if [ -z "$DEPLOY_URL" ]; then
+            # No Production label (older CLI, or an output shape we do not know).
+            # Fall back to the last URL rather than reporting nothing — a slightly
+            # wrong deploymentUrl still beats an unreported deploy.
+            DEPLOY_URL=$(printf '%s' "$CLEAN_OUTPUT" | grep -Eo 'https://[a-zA-Z0-9._/-]+' | tail -n 1 || true)
+            echo "Note: no 'Production' line found; fell back to last-URL extraction."
+          fi
+          if [ -n "$DEPLOY_URL" ]; then
+            echo "Captured deployment URL: $DEPLOY_URL"
+            echo "deployment_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          else
+            echo "No deployment URL parsed from CLI output (callback will omit deploymentUrl)."
+            echo "deployment_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+          ALIAS_URL=$(printf '%s' "$CLEAN_OUTPUT" \
+            | grep -Eo 'Aliased[[:space:]]+https://[a-zA-Z0-9._-]+' \
+            | grep -Eo 'https://[a-zA-Z0-9._-]+' \
+            | tail -n 1 || true)
+          if [ -n "$ALIAS_URL" ]; then
+            echo "Captured stable alias URL: $ALIAS_URL"
+            echo "alias_url=$ALIAS_URL" >> "$GITHUB_OUTPUT"
+          else
+            # Not fatal: the receiver falls back to deploymentUrl, preserving the
+            # old (lagging) behaviour rather than breaking the deploy.
+            echo "No alias URL parsed from CLI output (receiver will fall back to deploymentUrl)."
+            echo "alias_url=" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          VERCEL_ORG_ID: ${{ github.event.inputs.vercel_team_id || secrets.VERCEL_TEAM_ID }}
+          VERCEL_PROJECT_ID: ${{ github.event.inputs.vercel_project_id || secrets.VERCEL_PROJECT_ID }}
+
+      - name: Report deploy status via callback
+        if: always() && github.event.inputs.callback_url != ''
+        run: |
+          CALLBACK_URL="${{ github.event.inputs.callback_url }}"
+          CALLBACK_TOKEN="${{ github.event.inputs.callback_token }}"
+
+          # WR-04 (partial): workflow_dispatch inputs are NOT masked the way
+          # secrets.* are, so the tenant-scoped HMAC callback token would
+          # otherwise be visible in run metadata/logs. Register it as a masked
+          # value so it is redacted from any subsequent log line, and never echo
+          # it. (Full fix — move the credential to a repo/environment secret —
+          # is deferred as a design decision; see REVIEW-FIX.md WR-04.)
+          if [ -n "$CALLBACK_TOKEN" ]; then
+            echo "::add-mask::$CALLBACK_TOKEN"
+          fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS="ready"
+          else
+            STATUS="error"
+          fi
+
+          # Real Vercel deployment URL captured by the Deploy-to-Vercel step. The
+          # receiver's deployStatusCallbackSchema requires an absolute https:// URL
+          # (WR-03 anti-injection guard), so only include deploymentUrl when STATUS is
+          # ready AND the captured URL begins with https:// — otherwise preserve the
+          # status-only body (today's behavior) so error/empty-URL cases still report.
+          DEPLOY_URL="${{ steps.deploy-vercel.outputs.deployment_url }}"
+          ALIAS_URL="${{ steps.deploy-vercel.outputs.alias_url }}"
+          if [ "$STATUS" = "ready" ] && [ "${DEPLOY_URL#https://}" != "$DEPLOY_URL" ]; then
+            # aliasUrl is additive and independently guarded — include it only when
+            # it too is an absolute https URL, so a parse miss degrades to the old
+            # deploymentUrl-only body rather than failing schema validation.
+            if [ "${ALIAS_URL#https://}" != "$ALIAS_URL" ]; then
+              PAYLOAD="{\"status\": \"$STATUS\", \"deploymentUrl\": \"$DEPLOY_URL\", \"aliasUrl\": \"$ALIAS_URL\"}"
+              echo "Reporting deploy status '$STATUS' with deploymentUrl + aliasUrl to $CALLBACK_URL"
+            else
+              PAYLOAD="{\"status\": \"$STATUS\", \"deploymentUrl\": \"$DEPLOY_URL\"}"
+              echo "Reporting deploy status '$STATUS' with deploymentUrl to $CALLBACK_URL"
+            fi
+          else
+            PAYLOAD="{\"status\": \"$STATUS\"}"
+            echo "Reporting deploy status '$STATUS' to $CALLBACK_URL"
+          fi
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+          )
+
+          echo "Callback response: HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✓ Callback succeeded"
+          else
+            echo "⚠ Callback returned HTTP $HTTP_CODE (non-fatal)"
+          fi
