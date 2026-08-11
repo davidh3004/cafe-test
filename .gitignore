@@ -1,18 +1,36 @@
-# Dependencies
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
 /node_modules
+/.pnp
+.pnp.js
 
-# Build output. Deliberately NOT committed on the source branch: the deploy
-# workflow builds from source and commits the bundle onto the BUILD branch.
-# A dist/ checked into source would go stale and confuse which artifact is real.
-/dist
-
-# Local env / editor noise
-.env
-.env.*
-.DS_Store
-*.local
-
-# Test + tooling caches
+# testing
 /coverage
-/.vite
-/.yarn/install-state.gz
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
