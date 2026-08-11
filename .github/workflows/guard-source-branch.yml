@@ -1,0 +1,76 @@
+name: Guard source branch
+
+# WHY THIS EXISTS
+#
+# The deploy pipeline builds this theme and pushes the resulting *tenant site*
+# (a Next.js scaffold: package.json name "theta-theme-site", build "next build")
+# to a separate branch named <source>-build. GitHub then shows a
+# "main-build had recent pushes — Compare & pull request" banner on every visit.
+#
+# That banner is an invitation to merge the build output back over the source it
+# was built from. Accepting it replaces this theme's package.json with the
+# scaffold's, so the next deploy runs `next build`, produces .next/ instead of
+# dist/theme.bundle.js, and fails with "Build did not produce the expected
+# bundle" — an error that points at the theme rather than at the merge.
+#
+# That has already happened twice in this repo (PR #1 and PR #2). Build branches
+# flow one way only. This is the tripwire.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Catches the merge before it lands.
+  reject-build-branch-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse a pull request opened from a build branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD_REF" == *-build ]]; then
+            echo "::error title=Do not merge a build branch::'$HEAD_REF' is a deploy artifact branch. Merging it into main replaces the theme source with the generated tenant site and breaks every subsequent deploy. Close this pull request."
+            exit 1
+          fi
+          echo "OK — '$HEAD_REF' is not a build branch."
+
+  # Backstop: catches corruption that arrives some other way (a direct push, a
+  # merge performed with the guard disabled, a bad revert).
+  #
+  # Deliberately a NEGATIVE assertion — it looks for the scaffold's fingerprints
+  # rather than asserting a specific theme name. package.json stays the single
+  # source of truth for the theme's identity, so renaming the theme does not
+  # require editing this file.
+  source-branch-is-still-the-theme:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: main must hold theme source, not the generated tenant site
+        run: |
+          fail() { echo "::error title=main has been overwritten by the tenant site scaffold::$1"; exit 1; }
+
+          NAME=$(jq -r '.name // ""' package.json)
+          BUILD=$(jq -r '.scripts.build // ""' package.json)
+
+          if [[ "$NAME" == "theta-theme-site" ]]; then
+            fail "package.json name is 'theta-theme-site' — that is the generated site, not this theme. main was very likely overwritten by a merge from a *-build branch. Restore it with: git push --force-with-lease origin <last-good-theme-commit>:main"
+          fi
+
+          if [[ "$BUILD" == *"next build"* ]]; then
+            fail "build script is '$BUILD'. A theme builds a bundle with Vite; 'next build' means main now holds the tenant site scaffold."
+          fi
+
+          if [[ ! -f src/registry.ts ]]; then
+            fail "src/registry.ts is missing. A theme without its registry is not theme source."
+          fi
+
+          echo "OK — main holds theme source: name='$NAME', build='$BUILD'."
