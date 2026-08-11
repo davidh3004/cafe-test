@@ -2,8 +2,10 @@
  * Edge enforcement for stored CMS redirects (Phase 16 Plan 01, REDIR-02/03).
  *
  * A thin glue layer only — no fetch logic, no cache, no validation. All
- * network and caching lives in `lib/redirect-resolve.ts`; this file only
- * awaits `getRedirectMap()` and calls `resolveRedirect()`.
+ * network and caching lives in `lib/redirect-resolve.ts`; the bot filter and
+ * the click beacon live in `lib/redirect-clicks.ts`. This file only awaits
+ * `getRedirectMap()`, calls `resolveRedirect()`, and hands the beacon to
+ * `waitUntil`.
  *
  * WHY ENFORCEMENT LIVES HERE, NOT IN `RenderPage` (D-01):
  * `app/[slug]/page.tsx` is a single-segment dynamic route with no catch-all,
@@ -32,14 +34,39 @@
  * refusing it as a redirect SOURCE.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
+import {
+  NextResponse,
+  type NextRequest,
+  type NextFetchEvent,
+} from "next/server";
 import { getRedirectMap, resolveRedirect } from "./lib/redirect-resolve";
+import { reportRedirectClick, shouldCountClick } from "./lib/redirect-clicks";
 
-export async function middleware(request: NextRequest) {
+export async function middleware(request: NextRequest, event: NextFetchEvent) {
   const map = await getRedirectMap();
   const match = resolveRedirect(request.nextUrl.pathname, map);
 
   if (match) {
+    // REQ-2. `event.waitUntil` — never `await` — is the whole safety story
+    // here: the beacon runs after the redirect response has been handed to
+    // the visitor, so a slow or dead ingest endpoint costs an uncounted
+    // click and nothing else. Awaiting would put the platform's uptime on
+    // the critical path of every tenant's redirects, which is a far worse
+    // trade than losing a number off a dashboard.
+    //
+    // `reportRedirectClick` never rejects, so this cannot produce an
+    // unhandled rejection inside the isolate.
+    if (shouldCountClick(match.trackClicks, request.headers.get("user-agent"))) {
+      event.waitUntil(reportRedirectClick(request.nextUrl.pathname));
+    }
+
+    // `new URL(destination, base)` covers BOTH destination shapes with no
+    // branch: an absolute `https://partner.com/x` ignores the base entirely
+    // per the WHATWG URL spec, while an internal `/x` resolves against the
+    // request's own origin. This is load-bearing, not incidental — a
+    // hand-rolled `${origin}${destination}` concatenation here would
+    // silently emit `https://tenant.com/https://partner.com/x` for every
+    // external row that `buildRedirectMap` now admits.
     return NextResponse.redirect(
       new URL(match.destination, request.url),
       match.status

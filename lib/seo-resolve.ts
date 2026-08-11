@@ -92,6 +92,7 @@ interface VerificationSite {
   verificationGoogle?: string | null;
   verificationBing?: string | null;
   verificationYandex?: string | null;
+  verificationAhrefs?: string | null;
 }
 
 /** The narrow site shape `resolveSiteDefaults`/`buildSiteMetadataFrom` need. */
@@ -353,11 +354,23 @@ export function resolveVerification(
   const google = normalizeVerificationToken(site?.verificationGoogle);
   const bing = normalizeVerificationToken(site?.verificationBing);
   const yandex = normalizeVerificationToken(site?.verificationYandex);
+  const ahrefs = normalizeVerificationToken(site?.verificationAhrefs);
 
   const result: Record<string, unknown> = {};
   if (google) result.google = google;
   if (yandex) result.yandex = yandex;
-  if (bing) result.other = { "msvalidate.01": bing };
+
+  // Bing and Ahrefs both lack a first-class Next `Verification` key, so both
+  // route through the free-form `other` record under the exact tag name each
+  // vendor's own instructions specify. They must MERGE into one object rather
+  // than each assigning `result.other`: two assignments would silently drop
+  // whichever ran first, and the symptom — one verification quietly never
+  // confirming while the other works — is the same class of invisible failure
+  // Pitfall 5 documents for an unrecognized top-level key.
+  const other: Record<string, string> = {};
+  if (bing) other["msvalidate.01"] = bing;
+  if (ahrefs) other["ahrefs-site-verification"] = ahrefs;
+  if (Object.keys(other).length > 0) result.other = other;
 
   return Object.keys(result).length > 0
     ? (result as Metadata["verification"])
@@ -540,6 +553,42 @@ export function resolveCanonicalOverride(
   const url = parseHttpUrl(trimmed);
   if (!url || url.protocol !== "https:") return null;
   return trimmed;
+}
+
+/**
+ * Apply a `Site.titleTemplate` to a page title, or return the title unchanged.
+ *
+ * WHY THIS IS NEEDED AT ALL — Next applies a layout's `title.template` to its
+ * CHILD segments, never to a page in the SAME segment. `app/page.tsx` (the
+ * homepage) lives in the root segment alongside the root layout that declares
+ * the template, so it is excluded; `app/[slug]/page.tsx` is a child and gets
+ * it. The observable result on a live tenant (2026-08-10, surfaced by a
+ * Semrush "not enough text within the title tags" finding):
+ *
+ *     /            "Homepage"                <- template silently skipped
+ *     /nosotros    "Nosotros | Fixocargo"
+ *     /servicios   "Servicios | Fixocargo"
+ *
+ * So SITE-01's whole feature missed the single most important page on every
+ * tenant, and did it silently. `buildPageMetadataFrom` composes the template
+ * itself for the homepage and emits `title.absolute` (which bypasses any
+ * template, so there is no double application); every other route keeps its
+ * plain-string title and lets Next apply the template exactly as before.
+ *
+ * `%s` is Next's own placeholder, and `resolveSiteTitleTemplate`'s stored
+ * values always carry exactly one (the dashboard's `composeTitleTemplate`
+ * builds `"%s {separator} {suffix}"`, and `titleTemplateControlState` refuses
+ * to edit anything that doesn't round-trip). A template with no `%s` would
+ * discard the page title entirely, so it is treated as unusable and the bare
+ * title wins — the same "an absent value beats a wrong one" rule this module
+ * applies to blank titles and invalid locales.
+ */
+export function applyTitleTemplate(
+  template: string | undefined,
+  title: string
+): string {
+  if (!template || !template.includes("%s")) return title;
+  return template.replace("%s", title);
 }
 
 /**
@@ -737,6 +786,22 @@ export function buildPageMetadataFrom(
     robots: { index: !noindex, follow: true },
   };
   if (description) metadata.description = description;
+
+  // The homepage composes SITE-01's title template ITSELF, because Next will
+  // not do it for a page in the same segment as the layout that declares the
+  // template — see applyTitleTemplate's doc comment for the observed symptom
+  // (every tenant's homepage silently missing its brand suffix).
+  //
+  // Keyed on the resolved canonical PATH, not on which route called: `/` and
+  // `/{homepage-slug}` can pass the identical slug string, the same D-08
+  // reason resolveCanonicalPath exists. `title.absolute` bypasses any
+  // template, so the composed value can never be templated a second time;
+  // every non-homepage route keeps its plain-string title and Next's own
+  // child-segment template application, byte-identical to before.
+  if (resolveCanonicalPath(page, homepageSlug) === "/") {
+    const templated = applyTitleTemplate(resolveSiteTitleTemplate(site), title);
+    if (templated !== title) metadata.title = { absolute: templated };
+  }
 
   // Origin-gated block (Pitfall 2): metadataBase, alternates and
   // openGraph.url are all decided by this ONE conditional, never three

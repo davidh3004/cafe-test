@@ -3,6 +3,7 @@ import "./globals.css";
 import { fetchSite } from "../lib/strapi-client";
 import { resolveLocale, buildSiteMetadataFrom } from "../lib/seo-resolve";
 import { reportSeoDegrade } from "../lib/seo-report";
+import { AnalyticsScripts } from "./_lib/analytics-scripts";
 
 // Phase 14 (Plan 03): the root layout's first data dependency. The shared,
 // `cache()`-wrapped Site fetcher imported above is the SAME one `RenderPage`
@@ -63,6 +64,12 @@ export default async function RootLayout({
     <html lang={locale}>
       <body>
         <main>{children}</main>
+        {/* REQ-7/8/9. Rendered at the end of body with afterInteractive
+            strategy, never in head — measurement must not block first paint.
+            Renders nothing when no id is configured, which is every tenant's
+            default. `site` may be null here (a failed Site read degrades to
+            no tags, exactly like it degrades to no title). */}
+        <AnalyticsScripts site={site} />
       </body>
     </html>
   );

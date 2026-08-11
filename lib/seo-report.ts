@@ -42,11 +42,18 @@ import * as Sentry from "@sentry/nextjs";
  *   unconditional `console.error` below is the real record for this surface
  *   — accepted, matching the status quo for every other degrade site in this
  *   template, and not expanded in this phase.
+ * - `redirect-click-report-failed` (REQ-2) — the fire-and-forget click
+ *   beacon to the platform's ingest route rejected or resolved non-ok. The
+ *   visitor is unaffected: the beacon rides `waitUntil`, so the redirect
+ *   response was already returned before this could fire. The only
+ *   consequence is one uncounted click, which is why this is a degrade
+ *   report and not an error path.
  */
 export type SeoDegradeReason =
   | "origin-unresolvable"
   | "site-read-threw"
-  | "redirect-map-fetch-failed";
+  | "redirect-map-fetch-failed"
+  | "redirect-click-report-failed";
 
 /** The consumers of this channel (Plans 02-04, Phase 16 Plan 01). */
 export type SeoSurface =

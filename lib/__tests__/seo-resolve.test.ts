@@ -1234,6 +1234,54 @@ describe("resolveVerification — SITE-04, Bing routed through other[\"msvalidat
     });
   });
 
+  // Ahrefs (2026-08-10) has no first-class Next Verification key either, so it
+  // shares the `other` record with Bing. The merge is the part that matters:
+  // two independent `result.other = {...}` assignments would silently drop
+  // whichever ran first, and the symptom — one verification quietly never
+  // confirming — is invisible from the outside.
+  it("maps a non-blank Ahrefs value to other[\"ahrefs-site-verification\"]", () => {
+    const result = resolveVerification({ verificationAhrefs: "5c71459c" });
+    expect(result).toEqual({ other: { "ahrefs-site-verification": "5c71459c" } });
+    expect(result).not.toHaveProperty("ahrefs");
+  });
+
+  it("MERGES Bing and Ahrefs into one `other` record rather than clobbering", () => {
+    expect(
+      resolveVerification({ verificationBing: "def", verificationAhrefs: "5c71459c" })
+    ).toEqual({
+      other: { "msvalidate.01": "def", "ahrefs-site-verification": "5c71459c" },
+    });
+  });
+
+  it("emits all four simultaneously", () => {
+    expect(
+      resolveVerification({
+        verificationGoogle: "abc",
+        verificationBing: "def",
+        verificationYandex: "ghi",
+        verificationAhrefs: "jkl",
+      })
+    ).toEqual({
+      google: "abc",
+      yandex: "ghi",
+      other: { "msvalidate.01": "def", "ahrefs-site-verification": "jkl" },
+    });
+  });
+
+  it("extracts the Ahrefs token from the whole <meta> snippet the vendor hands you", () => {
+    expect(
+      resolveVerification({
+        verificationAhrefs:
+          '<meta name="ahrefs-site-verification" content="5c71459c6db1ebf6f4a8b121d511b8c92b431301f1c640a9d40c1df1c35e71fc">',
+      })
+    ).toEqual({
+      other: {
+        "ahrefs-site-verification":
+          "5c71459c6db1ebf6f4a8b121d511b8c92b431301f1c640a9d40c1df1c35e71fc",
+      },
+    });
+  });
+
   it("runs each raw value through the defensive normalizer — a whole <meta> snippet yields the bare token", () => {
     expect(
       resolveVerification({

@@ -13,6 +13,9 @@ vi.mock("../seo-report", () => ({
 
 import {
   httpStatusForRedirectType,
+  httpStatusForRule,
+  isAllowedDestination,
+  isExternalDestination,
   isInternalDestination,
   isReservedSource,
   buildRedirectMap,
@@ -105,6 +108,85 @@ describe("isInternalDestination (T-16-01: emission-side open-redirect closure)",
   });
 });
 
+describe("httpStatusForRule (REQ-2: tracking forces 302)", () => {
+  it("passes the stored type through when tracking is off", () => {
+    expect(httpStatusForRule("permanent", false)).toBe(301);
+    expect(httpStatusForRule("temporary", false)).toBe(302);
+    expect(httpStatusForRule(null, false)).toBe(301);
+    expect(httpStatusForRule(undefined, false)).toBe(301);
+  });
+
+  it("forces 302 when tracking is on, overriding a stored permanent", () => {
+    // Not a preference — a cached 301 never reaches middleware, so a tracked
+    // permanent redirect would undercount in proportion to how well the link
+    // actually works.
+    expect(httpStatusForRule("permanent", true)).toBe(302);
+    expect(httpStatusForRule("temporary", true)).toBe(302);
+    expect(httpStatusForRule(null, true)).toBe(302);
+  });
+
+  it("does not rewrite the stored type — turning tracking off restores it", () => {
+    expect(httpStatusForRule("permanent", true)).toBe(302);
+    expect(httpStatusForRule("permanent", false)).toBe(301);
+  });
+});
+
+describe("isExternalDestination (declared-external allowance)", () => {
+  it("accepts a declared https:// URL, with or without path, query, fragment or port", () => {
+    expect(isExternalDestination("https://partner.example.com")).toBe(true);
+    expect(isExternalDestination("https://partner.example.com/u/mab-radio")).toBe(true);
+    expect(isExternalDestination("https://partner.example.com/p?a=1#f")).toBe(true);
+    expect(isExternalDestination("https://partner.example.com:8443/p")).toBe(true);
+    expect(isExternalDestination("HTTPS://partner.example.com")).toBe(true);
+  });
+
+  it("rejects http:// — the platform never emits an insecure hop (decision 1)", () => {
+    expect(isExternalDestination("http://partner.example.com")).toBe(false);
+  });
+
+  it("rejects embedded credentials, whose real authority is the part after the @", () => {
+    expect(isExternalDestination("https://real.com@evil.com")).toBe(false);
+    expect(new URL("https://real.com@evil.com").hostname).toBe("evil.com");
+  });
+
+  it("rejects non-navigational schemes, bare hosts and protocol-relative forms", () => {
+    expect(isExternalDestination("javascript:alert(1)")).toBe(false);
+    expect(isExternalDestination("data:text/html,x")).toBe(false);
+    expect(isExternalDestination("file:///etc/passwd")).toBe(false);
+    expect(isExternalDestination("mailto:a@b.com")).toBe(false);
+    expect(isExternalDestination("evil.com")).toBe(false);
+    expect(isExternalDestination("//evil.com")).toBe(false);
+    expect(isExternalDestination("https://")).toBe(false);
+    expect(isExternalDestination("")).toBe(false);
+  });
+
+  it("rejects any value carrying a code point the URL parser would strip", () => {
+    // Stricter than isInternalDestination's strip-then-check on purpose: the
+    // stored external URL must be exactly what the parser resolves.
+    expect(isExternalDestination("https://partner.example.com/\tpath")).toBe(false);
+    expect(isExternalDestination("https://partner.example.com/\npath")).toBe(false);
+    expect(isExternalDestination("htt\tps://partner.example.com")).toBe(false);
+  });
+});
+
+describe("isAllowedDestination (what buildRedirectMap gates on)", () => {
+  it("is the union of the two predicates and nothing more", () => {
+    for (const value of [
+      "/new",
+      "https://partner.example.com",
+      "//evil.com",
+      "http://evil.com",
+      "evil.com",
+      "/\t/evil.com",
+      "",
+    ]) {
+      expect(isAllowedDestination(value)).toBe(
+        isInternalDestination(value) || isExternalDestination(value)
+      );
+    }
+  });
+});
+
 describe("isReservedSource (D-10 deny-list, T-16-02)", () => {
   it("returns true for every exact reserved path", () => {
     for (const path of RESERVED_SOURCE_PATHS) {
@@ -143,7 +225,7 @@ describe("buildRedirectMap (pure, never throws)", () => {
       row({ source: "/dup", destination: "/first" }),
       row({ source: "/dup", destination: "/second" }),
     ]);
-    expect(map["/dup"]).toEqual({ destination: "/second", status: 301 });
+    expect(map["/dup"]).toEqual({ destination: "/second", status: 301, trackClicks: false });
   });
 
   it("omits a row whose source is reserved", () => {
@@ -151,9 +233,64 @@ describe("buildRedirectMap (pure, never throws)", () => {
     expect(map["/api/foo"]).toBeUndefined();
   });
 
-  it("omits a row whose destination is not internal", () => {
-    const map = buildRedirectMap([row({ destination: "https://evil.com" })]);
+  it.each([
+    "evil.com",
+    "//evil.com",
+    "/\\evil.com",
+    "http://evil.com",
+    "https://real.com@evil.com",
+    "javascript:alert(1)",
+    "https://",
+    "/\t/evil.com",
+  ])("omits a row whose destination %j is neither a path nor a declared https:// URL", (destination) => {
+    const map = buildRedirectMap([row({ destination })]);
     expect(map["/old"]).toBeUndefined();
+  });
+
+  it("admits a row whose destination is a declared external https:// URL", () => {
+    const map = buildRedirectMap([
+      row({ destination: "https://partner.example.com/u/mab-radio", redirectType: "temporary" }),
+    ]);
+    expect(map["/old"]).toEqual({
+      destination: "https://partner.example.com/u/mab-radio",
+      status: 302,
+      trackClicks: false,
+    });
+  });
+
+  it("carries trackClicks onto the rule and forces 302 for a tracked row", () => {
+    const map = buildRedirectMap([
+      row({ source: "/tracked", redirectType: "permanent", trackClicks: true }),
+    ]);
+    expect(map["/tracked"]).toEqual({
+      destination: "/new",
+      status: 302,
+      trackClicks: true,
+    });
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["false", false],
+  ])("defaults trackClicks to a real false when the field is %s", (_label, value) => {
+    // A tenant whose Strapi has not yet restarted with the field returns
+    // nothing for it — the rule must still carry a boolean so middleware
+    // never has to interpret undefined.
+    const map = buildRedirectMap([row({ trackClicks: value })]);
+    expect(map["/old"]).toEqual({
+      destination: "/new",
+      status: 301,
+      trackClicks: false,
+    });
+  });
+
+  it("preserves an external destination byte-for-byte, trailing slash included", () => {
+    // Decision 3's storage rule has to survive the read side too — a map that
+    // normalised here would disagree with what the author saved and sent
+    // visitors to a URL the partner's server may treat as a different resource.
+    const map = buildRedirectMap([row({ destination: "https://partner.example.com/path/" })]);
+    expect(map["/old"]?.destination).toBe("https://partner.example.com/path/");
   });
 
   it("omits a row with a blank source or blank destination", () => {
@@ -278,7 +415,7 @@ describe("getRedirectMap (module-scope TTL cache, fetch, fail-open)", () => {
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(first).toBe(second);
-    expect(first["/a"]).toEqual({ destination: "/b", status: 301 });
+    expect(first["/a"]).toEqual({ destination: "/b", status: 301, trackClicks: false });
   });
 
   it("fails open to an empty map and reports once when fetch rejects", async () => {
