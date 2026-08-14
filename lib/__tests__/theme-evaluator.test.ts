@@ -117,7 +117,7 @@ describe("buildSandbox — the minimized, frozen global surface (D-04/D-05, SSR-
     "LucideReact",
   ];
 
-  it("exposes exactly the ten expected own enumerable keys", () => {
+  it("exposes exactly the expected own enumerable keys", () => {
     const sandbox = buildSandbox();
     const expected = [
       "React",
@@ -130,10 +130,20 @@ describe("buildSandbox — the minimized, frozen global surface (D-04/D-05, SSR-
       "process",
       "__THETA_THEMES__",
       "window",
+      // Minimal DOM stub. Added deliberately, reversing D-05's original
+      // "omit document" — `window` without `document` is a state no real
+      // environment has, and it broke every browser-guarded library at
+      // module scope. See buildSandbox's comment for the full reasoning.
+      "document",
+      "Node",
+      "Element",
+      "HTMLTemplateElement",
+      "DocumentFragment",
+      "NodeFilter",
     ].sort();
     const actual = Object.keys(sandbox).sort();
     expect(actual).toEqual(expected);
-    expect(actual).toHaveLength(10);
+    expect(actual).toHaveLength(16);
   });
 
   it("sets window strictly identical to the sandbox object itself", () => {
@@ -172,11 +182,97 @@ describe("buildSandbox — the minimized, frozen global surface (D-04/D-05, SSR-
     }
   });
 
-  it("omits document, localStorage, matchMedia, navigator, fetch and require (D-05)", () => {
+  it("still omits localStorage, matchMedia, navigator, fetch and require (D-05)", () => {
+    // `document` left this list on purpose (see the key-set test above); these
+    // five did NOT. They are the omissions that carry real risk — I/O, ambient
+    // capability, and a module loader — and widening the DOM surface must not
+    // quietly drag them in.
     const sandbox = buildSandbox() as Record<string, unknown>;
-    for (const key of ["document", "localStorage", "matchMedia", "navigator", "fetch", "require"]) {
+    for (const key of ["localStorage", "matchMedia", "navigator", "fetch", "require"]) {
       expect(key in sandbox, `${key} should be absent`).toBe(false);
     }
+  });
+
+  it("defines the DOM stub non-writable and non-configurable, like every other global", () => {
+    const sandbox = buildSandbox();
+    for (const key of ["document", "Node", "Element", "HTMLTemplateElement", "DocumentFragment", "NodeFilter"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(sandbox, key);
+      expect(descriptor, `descriptor for ${key}`).toBeDefined();
+      expect(descriptor!.writable, `${key} writable`).toBe(false);
+      expect(descriptor!.configurable, `${key} configurable`).toBe(false);
+    }
+  });
+
+  it("hands out a FRESH element per createElement call, so sections cannot pass state through it", () => {
+    const sandbox = buildSandbox() as Record<string, any>;
+    const a = sandbox.document.createElement("div");
+    const b = sandbox.document.createElement("div");
+    expect(a).not.toBe(b);
+    a.marker = "leaked";
+    expect(b.marker).toBeUndefined();
+    // Same for the live accessors — body/head must not be a shared singleton.
+    expect(sandbox.document.body).not.toBe(sandbox.document.body);
+  });
+
+  it("reaches the stub through window.document, the way libraries actually look for it", () => {
+    const sandbox = buildSandbox() as Record<string, any>;
+    expect(sandbox.window.document).toBe(sandbox.document);
+    expect(typeof sandbox.window.document.createElement).toBe("function");
+  });
+});
+
+describe("buildSandbox — module-scope browser-guarded code (the SSR-blocking regression)", () => {
+  // The exact shape that silently disabled SSR for every tenant: a theme calls a
+  // browser library at MODULE SCOPE behind `typeof window !== "undefined"`. With
+  // `window` defined but `document` missing, the guard passed and the library —
+  // in its no-document degraded form — was missing the method being called. The
+  // throw happened while the bundle was still evaluating, so the entire theme
+  // failed to register, not just one section.
+  it("evaluates a bundle whose module scope takes the browser branch", () => {
+    const source = `
+      (function () {
+        var lib = (typeof document !== "undefined")
+          ? { addHook: function () { return "installed"; } }
+          : { /* degraded stub: no addHook */ };
+        var installed = null;
+        if (typeof window !== "undefined") {
+          installed = lib.addHook("afterSanitizeAttributes", function () {});
+        }
+        window.__THETA_THEMES__["guarded-theme"] = {
+          name: "guarded-theme",
+          version: "1.0.0",
+          installed: installed,
+          sectionsComponents: {},
+          sectionSettingsSchemas: {},
+          blocksComponents: {},
+          blockSettingsSchemas: {},
+          sectionBlocksConfig: {},
+        };
+      })();
+    `;
+    const result = evaluateThemeSource(source, "guarded-theme");
+    expect(result).not.toBeNull();
+    // Proves the browser branch actually ran, rather than the guard being skipped.
+    expect((result as Record<string, unknown>).installed).toBe("installed");
+  });
+
+  it("still registers a theme that takes the non-browser branch", () => {
+    const source = `
+      (function () {
+        var touched = (typeof document === "undefined") ? "no-dom" : "dom";
+        window.__THETA_THEMES__["plain-theme"] = {
+          name: "plain-theme",
+          version: "1.0.0",
+          touched: touched,
+          sectionsComponents: {},
+          sectionSettingsSchemas: {},
+          blocksComponents: {},
+          blockSettingsSchemas: {},
+          sectionBlocksConfig: {},
+        };
+      })();
+    `;
+    expect(evaluateThemeSource(source, "plain-theme")).not.toBeNull();
   });
 });
 

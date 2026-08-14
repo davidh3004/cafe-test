@@ -42,19 +42,58 @@ import * as Sentry from "@sentry/nextjs";
  *   unconditional `console.error` below is the real record for this surface
  *   — accepted, matching the status quo for every other degrade site in this
  *   template, and not expanded in this phase.
+ * - `redirect-click-report-failed` (REQ-2) — the fire-and-forget click
+ *   beacon to the platform's ingest route rejected or resolved non-ok. The
+ *   visitor is unaffected: the beacon rides `waitUntil`, so the redirect
+ *   response was already returned before this could fire. The only
+ *   consequence is one uncounted click, which is why this is a degrade
+ *   report and not an error path.
+ * - `blog-template-not-declared` (Phase 21, D-09/D-11/D-12) — the live
+ *   theme's manifest declares no `article` (or no `archive`) template, or
+ *   declares one without its required section slot. `blog-degrade.ts`'s
+ *   `resolveBlogSurfaceSupport` responds 404 inside the theme's own chrome
+ *   with fixed, stated copy rather than a blank page or a crash. The
+ *   context is boolean-only (T-21-11): which inputs were present, never a
+ *   manifest's content or any CMS field value.
+ * - `sitemap-post-cap-exceeded` (Phase 23, D-6/BLOG-09/T-23-06) — the
+ *   sitemap's post enumeration (`fetchSitemapArticles`,
+ *   `lib/blog-client.ts`) hit its `SITEMAP_ARTICLE_MAX_PAGES` cap: the
+ *   sitemap emitted the newest `SITEMAP_ARTICLE_PAGE_SIZE *
+ *   SITEMAP_ARTICLE_MAX_PAGES` published posts in the query's deterministic
+ *   sort order (newest `publishedAt` first), and the remainder are absent by
+ *   an EXPLICIT, reported cap rather than by silent truncation. The context
+ *   carries primitive counts only (T-23-06) — never a slug, a title, or any
+ *   other CMS field value.
+ * - `blog-index-url-collision` (Phase 23, Plan 05, Task 2, D-8/T-23-23) — a
+ *   published CMS page already occupies the blog listing's URL (the
+ *   Fixocargo-tenant hazard recorded in STATE.md: a page at slug `blog`
+ *   Phase 22's static `/blog` segment will shadow on its next re-template).
+ *   `mergeSitemapEntries`'s first-wins rule means the sitemap still emits
+ *   that URL exactly once — never twice — but the collision itself would
+ *   otherwise be silently absorbed rather than observable. This report is
+ *   that observation, not a fix: the recorded resolution is renaming the
+ *   affected tenant page's slug, tracked outside this phase. The context
+ *   carries primitive counts only, matching every other reason above — never
+ *   the colliding page's own slug or title.
  */
 export type SeoDegradeReason =
   | "origin-unresolvable"
   | "site-read-threw"
-  | "redirect-map-fetch-failed";
+  | "redirect-map-fetch-failed"
+  | "redirect-click-report-failed"
+  | "blog-template-not-declared"
+  | "sitemap-post-cap-exceeded"
+  | "blog-index-url-collision";
 
-/** The consumers of this channel (Plans 02-04, Phase 16 Plan 01). */
+/** The consumers of this channel (Plans 02-04, Phase 16 Plan 01, Phase 21
+ * Plan 04 / Phase 22's post & archive routes). */
 export type SeoSurface =
   | "page-metadata"
   | "root-layout"
   | "sitemap"
   | "robots"
-  | "middleware";
+  | "middleware"
+  | "blog-surface";
 
 /**
  * The one and only reporting seam in this module. `context` is constrained

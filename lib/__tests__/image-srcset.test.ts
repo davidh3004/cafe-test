@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 //   - orders entries ascending by width regardless of input key order
 //   - never throws on null/undefined/malformed/empty input
 //   - only returns srcSet/sizes keys when a srcSet was actually produced
-import { buildSrcSet } from "../image-srcset";
+import { buildSrcSet, resolveIntrinsicSize } from "../image-srcset";
 
 describe("buildSrcSet — pure srcset/sizes builder (D-01)", () => {
   it("Test 1: builds an ascending-by-width srcSet + default 100vw sizes, regardless of input key order", () => {
@@ -67,5 +67,59 @@ describe("buildSrcSet — pure srcset/sizes builder (D-01)", () => {
   it("Test 6: returns {} for an empty formats object — nothing to offer", () => {
     expect(buildSrcSet({})).toEqual({});
     expect(Object.keys(buildSrcSet({}))).toHaveLength(0);
+  });
+});
+
+// Phase 18 (item 12): the intrinsic-size half of the same theme-facing image
+// contract buildSrcSet belongs to.
+describe("resolveIntrinsicSize", () => {
+  it("prefers the file's own width/height — the only authoritative source", () => {
+    expect(
+      resolveIntrinsicSize({
+        width: 1600,
+        height: 900,
+        formats: { large: { url: "/l.jpg", width: 1000, height: 562 } },
+      })
+    ).toEqual({ width: 1600, height: 900 });
+  });
+
+  it("falls back to the LARGEST format variant when the file has no dimensions", () => {
+    expect(
+      resolveIntrinsicSize({
+        formats: {
+          thumbnail: { url: "/t.jpg", width: 245, height: 138 },
+          large: { url: "/l.jpg", width: 1000, height: 562 },
+          medium: { url: "/m.jpg", width: 750, height: 422 },
+        },
+      })
+    ).toEqual({ width: 1000, height: 562 });
+  });
+
+  it("returns null rather than a half pair when only one dimension is known", () => {
+    expect(resolveIntrinsicSize({ width: 1600 })).toBeNull();
+    expect(resolveIntrinsicSize({ height: 900 })).toBeNull();
+  });
+
+  it("returns null when a format variant has a width but no height", () => {
+    expect(
+      resolveIntrinsicSize({ formats: { large: { url: "/l.jpg", width: 1000 } } })
+    ).toBeNull();
+  });
+
+  it("rejects zero, negative and non-finite dimensions", () => {
+    expect(resolveIntrinsicSize({ width: 0, height: 100 })).toBeNull();
+    expect(resolveIntrinsicSize({ width: -10, height: 100 })).toBeNull();
+    expect(resolveIntrinsicSize({ width: Number.NaN, height: 100 })).toBeNull();
+    expect(resolveIntrinsicSize({ width: Infinity, height: 100 })).toBeNull();
+  });
+
+  it("never throws and returns null for nullish/malformed input", () => {
+    expect(resolveIntrinsicSize(null)).toBeNull();
+    expect(resolveIntrinsicSize(undefined)).toBeNull();
+    expect(resolveIntrinsicSize({})).toBeNull();
+    expect(resolveIntrinsicSize({ formats: null })).toBeNull();
+    expect(
+      resolveIntrinsicSize({ formats: "nope" as unknown as null })
+    ).toBeNull();
   });
 });

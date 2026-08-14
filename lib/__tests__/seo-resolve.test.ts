@@ -20,6 +20,7 @@ import {
   resolveSiteTitleTemplate,
   resolveVerification,
   normalizeVerificationToken,
+  resolvePostCanonical,
 } from "../seo-resolve";
 import type { StrapiPage, StrapiSite } from "../strapi-client";
 // Phase 14, Plan 06 (G-14-4): the rendered-head-tag harness. Drives Next's
@@ -352,6 +353,50 @@ describe("resolveCanonicalOverride — SEOED-05 emission-side re-validation (D-1
   it("never throws, even for a pathological input", () => {
     const pathological = "https://" + "a".repeat(10000) + ".com/" + "x".repeat(10000);
     expect(() => resolveCanonicalOverride(pathological)).not.toThrow();
+  });
+});
+
+// Phase 23, Plan 01, Task 2 (D-1): the single producer of a post's canonical
+// URL — structurally identical to resolvePageCanonical, composing via
+// resolvePostPath rather than a second inline path.
+describe("resolvePostCanonical — the D-1 single producer for a post's URL", () => {
+  it("composes the absolute post URL from the slug when no override is present", () => {
+    expect(resolvePostCanonical({ slug: "hello-world" }, "https://acme.com")).toBe(
+      "https://acme.com/blog/hello-world"
+    );
+  });
+
+  it("percent-encodes a slug containing a slash on the way into the composed URL", () => {
+    expect(resolvePostCanonical({ slug: "a/b" }, "https://acme.com")).toBe(
+      "https://acme.com/blog/a%2Fb"
+    );
+  });
+
+  it("a valid absolute https canonicalUrl override wins over the composed URL", () => {
+    expect(
+      resolvePostCanonical(
+        { slug: "hello-world", canonicalUrl: "https://elsewhere.example/canonical-post" },
+        "https://acme.com"
+      )
+    ).toBe("https://elsewhere.example/canonical-post");
+  });
+
+  it("a non-https canonicalUrl override is ignored in favour of the composed URL", () => {
+    expect(
+      resolvePostCanonical(
+        { slug: "hello-world", canonicalUrl: "http://elsewhere.example/canonical-post" },
+        "https://acme.com"
+      )
+    ).toBe("https://acme.com/blog/hello-world");
+  });
+
+  it("treats a null/undefined slug as an empty segment rather than throwing", () => {
+    expect(resolvePostCanonical({ slug: null }, "https://acme.com")).toBe(
+      "https://acme.com/blog/"
+    );
+    expect(resolvePostCanonical(undefined, "https://acme.com")).toBe(
+      "https://acme.com/blog/"
+    );
   });
 });
 
@@ -1231,6 +1276,54 @@ describe("resolveVerification — SITE-04, Bing routed through other[\"msvalidat
       google: "abc",
       yandex: "ghi",
       other: { "msvalidate.01": "def" },
+    });
+  });
+
+  // Ahrefs (2026-08-10) has no first-class Next Verification key either, so it
+  // shares the `other` record with Bing. The merge is the part that matters:
+  // two independent `result.other = {...}` assignments would silently drop
+  // whichever ran first, and the symptom — one verification quietly never
+  // confirming — is invisible from the outside.
+  it("maps a non-blank Ahrefs value to other[\"ahrefs-site-verification\"]", () => {
+    const result = resolveVerification({ verificationAhrefs: "5c71459c" });
+    expect(result).toEqual({ other: { "ahrefs-site-verification": "5c71459c" } });
+    expect(result).not.toHaveProperty("ahrefs");
+  });
+
+  it("MERGES Bing and Ahrefs into one `other` record rather than clobbering", () => {
+    expect(
+      resolveVerification({ verificationBing: "def", verificationAhrefs: "5c71459c" })
+    ).toEqual({
+      other: { "msvalidate.01": "def", "ahrefs-site-verification": "5c71459c" },
+    });
+  });
+
+  it("emits all four simultaneously", () => {
+    expect(
+      resolveVerification({
+        verificationGoogle: "abc",
+        verificationBing: "def",
+        verificationYandex: "ghi",
+        verificationAhrefs: "jkl",
+      })
+    ).toEqual({
+      google: "abc",
+      yandex: "ghi",
+      other: { "msvalidate.01": "def", "ahrefs-site-verification": "jkl" },
+    });
+  });
+
+  it("extracts the Ahrefs token from the whole <meta> snippet the vendor hands you", () => {
+    expect(
+      resolveVerification({
+        verificationAhrefs:
+          '<meta name="ahrefs-site-verification" content="5c71459c6db1ebf6f4a8b121d511b8c92b431301f1c640a9d40c1df1c35e71fc">',
+      })
+    ).toEqual({
+      other: {
+        "ahrefs-site-verification":
+          "5c71459c6db1ebf6f4a8b121d511b8c92b431301f1c640a9d40c1df1c35e71fc",
+      },
     });
   });
 

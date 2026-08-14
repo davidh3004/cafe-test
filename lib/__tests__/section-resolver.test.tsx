@@ -8,6 +8,7 @@ import {
 } from "../section-resolver";
 import type { LoadedThemeModule } from "../theme-loader";
 import type { StrapiPage } from "../strapi-client";
+import type { ArticleProp } from "../article-contract";
 
 function Noop() {
   return null;
@@ -305,5 +306,168 @@ describe("convertStrapiDataToProps — image/json URL normalization preserved", 
   it("passes through flat (already-converted) values unchanged", () => {
     const data = { title: "Hello" };
     expect(convertStrapiDataToProps(data)).toEqual({ title: "Hello" });
+  });
+});
+
+describe("buildSectionProps — optional recordProps (Phase 21, D-06/D-16)", () => {
+  const themeModule = makeThemeModule({ hero: Noop });
+  const article: ArticleProp = {
+    documentId: "a1",
+    title: "A Post",
+    slug: "a-post",
+    body: "<p>Body</p>",
+    excerpt: "",
+    featuredImage: null,
+    category: null,
+    tags: [],
+    author: null,
+    publishedAt: null,
+    updatedAt: null,
+  };
+
+  it("called WITHOUT record props (three arguments) returns exactly what it returns today -- no article key present", () => {
+    const section = { sectionKey: "hero", order: 0, data: {}, blocks: [] };
+    const props = buildSectionProps(section, 0, themeModule);
+    expect(props).not.toHaveProperty("article");
+    expect(props).not.toHaveProperty("archive");
+  });
+
+  it("called with an empty recordProps object still carries no article/archive key", () => {
+    const section = { sectionKey: "hero", order: 0, data: {}, blocks: [] };
+    const props = buildSectionProps(section, 0, themeModule, {});
+    expect(props).not.toHaveProperty("article");
+    expect(props).not.toHaveProperty("archive");
+  });
+
+  it("called WITH { article } spreads article into the returned prop bag alongside sectionId/sectionName/data", () => {
+    const section = {
+      sectionKey: "hero",
+      order: 0,
+      data: { title: { type: "text", value: "Hero" } },
+      blocks: [],
+    };
+    const props = buildSectionProps(section, 0, themeModule, { article });
+
+    expect(props.article).toBe(article);
+    expect(props.sectionName).toBe("hero");
+    expect(props.title).toBe("Hero");
+  });
+});
+
+describe("buildSectionProps — optional relatedPosts (Phase 23, Plan 04, Task 3, D-4)", () => {
+  const themeModule = makeThemeModule({ hero: Noop });
+  const relatedPosts: ArticleProp[] = [
+    {
+      documentId: "r1",
+      title: "Related Post",
+      slug: "related-post",
+      body: "<p>Body</p>",
+      excerpt: "",
+      featuredImage: null,
+      category: null,
+      tags: [],
+      author: null,
+      publishedAt: null,
+      updatedAt: null,
+    },
+  ];
+
+  it("when relatedPosts is absent from the record props, the resulting section prop bag has no relatedPosts key at all", () => {
+    const section = { sectionKey: "hero", order: 0, data: {}, blocks: [] };
+    const props = buildSectionProps(section, 0, themeModule);
+    expect(Object.prototype.hasOwnProperty.call(props, "relatedPosts")).toBe(false);
+  });
+
+  it("when recordProps is an empty object, the resulting section prop bag has no relatedPosts key", () => {
+    const section = { sectionKey: "hero", order: 0, data: {}, blocks: [] };
+    const props = buildSectionProps(section, 0, themeModule, {});
+    expect(Object.prototype.hasOwnProperty.call(props, "relatedPosts")).toBe(false);
+  });
+
+  it("when relatedPosts is present, it is spread into the returned prop bag", () => {
+    const section = { sectionKey: "hero", order: 0, data: {}, blocks: [] };
+    const props = buildSectionProps(section, 0, themeModule, { relatedPosts });
+    expect(props.relatedPosts).toBe(relatedPosts);
+  });
+
+  it("every section in the composition receives relatedPosts when present", () => {
+    const page = {
+      documentId: "p1",
+      title: "Post",
+      slug: "post",
+      page_template: {
+        sections: [
+          { sectionKey: "header", order: 0, data: {} },
+          { sectionKey: "article-body", order: 1, data: {} },
+        ],
+      },
+    } as unknown as StrapiPage;
+
+    const multiSectionThemeModule = makeThemeModule({ header: Noop, "article-body": Noop });
+    const resolved = resolveSectionsForRender(page, multiSectionThemeModule, undefined, {
+      relatedPosts,
+    });
+
+    expect(resolved).toHaveLength(2);
+    for (const section of resolved) {
+      expect(section.props.relatedPosts).toBe(relatedPosts);
+    }
+  });
+});
+
+describe("resolveSectionsForRender — recordProps forwarded to every section (Phase 21, D-06)", () => {
+  it("threads the same article object into EVERY resolved section's props, not only one", () => {
+    const page = {
+      documentId: "p1",
+      title: "Post",
+      slug: "post",
+      page_template: {
+        sections: [
+          { sectionKey: "header", order: 0, data: {} },
+          { sectionKey: "article-body", order: 1, data: {} },
+        ],
+      },
+    } as unknown as StrapiPage;
+
+    const themeModule = makeThemeModule({ header: Noop, "article-body": Noop });
+    const article: ArticleProp = {
+      documentId: "a1",
+      title: "A Post",
+      slug: "a-post",
+      body: "<p>Body</p>",
+      excerpt: "",
+      featuredImage: null,
+      category: null,
+      tags: [],
+      author: null,
+      publishedAt: null,
+      updatedAt: null,
+    };
+
+    const resolved = resolveSectionsForRender(page, themeModule, undefined, { article });
+
+    expect(resolved).toHaveLength(2);
+    for (const section of resolved) {
+      expect(section.props.article).toBe(article);
+    }
+  });
+
+  it("two sections sharing the same order value keep their stored array position", () => {
+    const page = {
+      documentId: "p1",
+      title: "Post",
+      slug: "post",
+      page_template: {
+        sections: [
+          { sectionKey: "header", order: 0, data: {} },
+          { sectionKey: "article-body", order: 0, data: {} },
+        ],
+      },
+    } as unknown as StrapiPage;
+
+    const themeModule = makeThemeModule({ header: Noop, "article-body": Noop });
+    const resolved = resolveSectionsForRender(page, themeModule);
+
+    expect(resolved.map((r) => r.sectionKey)).toEqual(["header", "article-body"]);
   });
 });

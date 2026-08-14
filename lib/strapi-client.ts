@@ -2,6 +2,7 @@ import { cache } from "react";
 import { GraphQLClient } from "graphql-request";
 import { gql } from "graphql-request";
 import { resolvePageForLiveTheme } from "./live-resolve";
+import type { TemplateSupportManifest } from "./article-contract";
 
 // Helper function to normalize URLs - ensures they have a protocol
 // Exported (no behavior change) so `lib/seo-resolve.ts` reuses this one
@@ -28,7 +29,12 @@ const STRAPI_BASE_URL = rawStrapiUrl ? normalizeUrl(rawStrapiUrl) : "";
 const STRAPI_ACCESS_TOKEN = process.env.NEXT_PUBLIC_STRAPI_TOKEN || "";
 
 // Create GraphQL client
-const graphqlEndpoint = STRAPI_BASE_URL ? `${STRAPI_BASE_URL}/graphql` : "";
+// Exported (Phase 22, BLOG-07) so `lib/blog-client.ts` reuses this SAME
+// unconfigured-endpoint short-circuit check rather than re-reading
+// NEXT_PUBLIC_STRAPI_URL itself -- a second env-var read (and therefore a
+// second, potentially divergent, token/endpoint resolution) is exactly the
+// drift this codebase collapses into single seams (see that file's header).
+export const graphqlEndpoint = STRAPI_BASE_URL ? `${STRAPI_BASE_URL}/graphql` : "";
 
 export const strapiClient = new GraphQLClient(graphqlEndpoint, {
   headers: {
@@ -102,6 +108,10 @@ const SITE_SCALAR_FIELDS = `
   verificationGoogle
   verificationBing
   verificationYandex
+  verificationAhrefs
+  googleAnalyticsId
+  googleAdsId
+  metaPixelId
 `;
 
 // canonicalUrl (Phase 16 / SEOED-05): a top-level Page scalar, NOT inside
@@ -226,6 +236,29 @@ const getPageBySlugUnfilteredQuery = gql`
 // plus `titleTemplate`/`verification*`) now comes from the single
 // `SITE_SCALAR_FIELDS` const above rather than four inline lines, so the
 // Site scalar names appear once in this file, not twice.
+//
+// Phase 22 (BLOG-07): `liveTheme`'s COMMON sub-selection (the fields both the
+// manifest-bearing and manifest-less queries carry) is factored into
+// `SITE_LIVE_THEME_LIVETHEME_FIELDS` — the same one-definition convention
+// `SEO_FIELDS`/`SITE_SCALAR_FIELDS`/`PAGE_SCALAR_AND_SEO_FIELDS` already
+// establish — so a future field addition on `liveTheme` cannot land on one
+// query and silently miss the other.
+const SITE_LIVE_THEME_LIVETHEME_FIELDS = `
+  documentId
+  name
+  builtAssetUrl
+  # Theme.lastDeployedAt (datetime, written by the platform's deploy
+  # status callback at the moment a rebuild lands) is the D-06
+  # cache-bust token consumed by resolveLiveBundle (17-05, PERF-04).
+  # LIVE-SCHEMA RISK (documented, not mitigated): a field the tenant
+  # schema does not expose fails the WHOLE query, so a tenant on an
+  # older Strapi schema loses the live-theme read entirely.
+  # lastDeployedAt has existed on the Theme content type since before
+  # this milestone, so the risk is accepted rather than guarded with a
+  # second query.
+  lastDeployedAt
+`;
+
 const getSiteLiveThemeQuery = gql`
   query GetSiteLiveTheme {
     site {
@@ -234,19 +267,39 @@ const getSiteLiveThemeQuery = gql`
         ${SEO_FIELDS}
       }
       liveTheme {
-        documentId
-        name
-        builtAssetUrl
-        # Theme.lastDeployedAt (datetime, written by the platform's deploy
-        # status callback at the moment a rebuild lands) is the D-06
-        # cache-bust token consumed by resolveLiveBundle (17-05, PERF-04).
-        # LIVE-SCHEMA RISK (documented, not mitigated): a field the tenant
-        # schema does not expose fails the WHOLE query, so a tenant on an
-        # older Strapi schema loses the live-theme read entirely.
-        # lastDeployedAt has existed on the Theme content type since before
-        # this milestone, so the risk is accepted rather than guarded with a
-        # second query.
-        lastDeployedAt
+        ${SITE_LIVE_THEME_LIVETHEME_FIELDS}
+        # Phase 22 (BLOG-07): the theme's declared templates/sections manifest
+        # (JSON scalar, same shape treatment as Page.metafields), typed as
+        # TemplateSupportManifest. Without this selection
+        # resolveBlogSurfaceSupport (Phase 21) sees undefined and reports
+        # every tenant as unsupported -- see RESEARCH Pitfall 1. A tenant whose
+        # Theme schema predates this field fails the WHOLE document (Strapi
+        # rejects unknown fields), which is why fetchSite below retries with
+        # a manifest-less legacy operation rather than letting that failure
+        # blank the tenant's entire site.
+        sectionsManifest
+      }
+    }
+  }
+`;
+
+// Manifest-less fallback (Phase 22, BLOG-07): byte-identical to
+// `getSiteLiveThemeQuery` MINUS `sectionsManifest`, built from the SAME
+// `SITE_SCALAR_FIELDS`/`SEO_FIELDS`/`SITE_LIVE_THEME_LIVETHEME_FIELDS`
+// consts. `fetchSite` sends this only after the primary query throws — a
+// schema-safety net for a tenant whose Theme content type does not yet
+// expose `sectionsManifest`, so that tenant still gets its site (minus the
+// manifest) instead of `fetchSite` returning `null` and blanking the whole
+// site (the 2026-08-04 incident recorded above).
+const getSiteLiveThemeLegacyQuery = gql`
+  query GetSiteLiveThemeLegacy {
+    site {
+      ${SITE_SCALAR_FIELDS}
+      seo {
+        ${SEO_FIELDS}
+      }
+      liveTheme {
+        ${SITE_LIVE_THEME_LIVETHEME_FIELDS}
       }
     }
   }
@@ -336,6 +389,11 @@ export interface StrapiSite {
   verificationGoogle?: string | null;
   verificationBing?: string | null;
   verificationYandex?: string | null;
+  /** REQ-7/8/9. Raw as stored — every consumer re-normalizes at emission
+   * (lib/analytics-resolve.ts), because these become inline script text. */
+  googleAnalyticsId?: string | null;
+  googleAdsId?: string | null;
+  metaPixelId?: string | null;
   seo?: StrapiSeo | null;
   liveTheme?: {
     documentId: string;
@@ -343,6 +401,14 @@ export interface StrapiSite {
     builtAssetUrl?: string | null;
     /** D-06 cache-bust token; see the comment above the query selection. */
     lastDeployedAt?: string | null;
+    /**
+     * Phase 22 (BLOG-07): the theme's declared templates/sections manifest,
+     * read via `getSiteLiveThemeQuery`. Absent (`undefined`) whenever the
+     * `GetSiteLiveThemeLegacy` fallback served the response instead — a
+     * tenant on an older Theme schema still gets `liveTheme`, just without
+     * this field, rather than losing `fetchSite` entirely.
+     */
+    sectionsManifest?: TemplateSupportManifest | null;
   } | null;
 }
 
@@ -412,21 +478,56 @@ function isMetaobjectRef(val: unknown): val is { type: "metaobject_ref"; value: 
 }
 
 /**
- * Type predicate for an image-typed field value: `{ type: "image", value: ... }`
- * where `value` is either a bare numeric/string id (id-only, not yet hydrated with
- * a url) or an `{ id, url, formats? }` object.
+ * Type predicate for an image-typed field value. Two accepted shapes:
+ *
+ *   1. `{ type: "image", value: <id> | { id, url, formats? } }`
+ *   2. `{ type: "json",  value: { id, url } }`
+ *
+ * THE SECOND SHAPE IS THE COMMON ONE, and missing it made this whole
+ * formats/dimensions pipeline dead code in production (root cause of PERF-03,
+ * found 2026-08-10 by reading a live tenant's RSC payload).
+ *
+ * The dashboard's own writer decides the tag: `lib/adapters/strapi/strapiAdapter.ts`
+ * persists an image with BOTH an id and a url — the normal, fully-picked case,
+ * i.e. virtually every image on every tenant — as `{ type: 'json', value:
+ * { id, url } }`, with the deliberate comment "store as JSON to preserve both
+ * … so theme components can access .url directly". Only the id-ONLY case is
+ * tagged `type: 'image'`. So a predicate keyed on `type === "image"` matched
+ * almost nothing real: `collectImageIds` returned `[]`, `resolveImageFormats`
+ * hit its `ids.length === 0` early return, and NO REQUEST WAS EVER MADE —
+ * which is why this failed with no 403, no console.warn, and no trace in any
+ * log. It was diagnosed for weeks as a "fail-open" (17-11's PERF-03 blocker);
+ * the fail-open catch was never even reached.
+ *
+ * Widening on SHAPE, not just on the tag, is what makes this safe: `type:
+ * 'json'` is also the adapter's catch-all for page references and arbitrary
+ * JSON, so an image is recognized only by carrying BOTH an `id` and a string
+ * `url`. `PageReferenceValue` (`{ id?, slug?, title? }`) has no `url` and
+ * cannot match. A `{ id: null, url }` value (the WR-04 url-only round-trip)
+ * has no id to look up and is correctly ignored. A video stored the same way
+ * would match, which is harmless: Strapi returns no `formats` for one, and
+ * its real `width`/`height` are not wrong to carry.
  */
 function isImageTypedValue(
   val: unknown
 ): val is {
-  type: "image";
+  type: "image" | "json";
   value: { id?: number | string | null; url?: string | null; formats?: unknown } | number | string | null;
 } {
-  return (
-    typeof val === "object" &&
-    val !== null &&
-    (val as Record<string, unknown>).type === "image"
-  );
+  if (typeof val !== "object" || val === null) return false;
+  const record = val as Record<string, unknown>;
+
+  if (record.type === "image") return true;
+  if (record.type !== "json") return false;
+
+  // Shape gate for the `json` tag — see the doc comment above.
+  const value = record.value;
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  const hasId =
+    typeof candidate.id === "number" ||
+    (typeof candidate.id === "string" && candidate.id.trim() !== "");
+  return hasId && typeof candidate.url === "string";
 }
 
 /**
@@ -511,26 +612,45 @@ function resolveRefsInData(
 // filter by those at all. The Upload plugin's REST endpoint can — it exposes
 // numeric `id` and `formats` directly — so this uses REST instead, with no
 // content migration required.
-interface UploadFileFormatsEntry {
-  id: string | number;
+export interface UploadFileMeta {
+  /** Strapi's resize-variant map, keyed by variant name. */
   formats?: unknown;
+  /** The ORIGINAL file's intrinsic pixel width, when Strapi knows it. */
+  width?: number;
+  /** The ORIGINAL file's intrinsic pixel height, when Strapi knows it. */
+  height?: number;
+}
+
+interface UploadFileMetaEntry extends UploadFileMeta {
+  id: string | number;
 }
 
 /**
- * Fetch `{ id, formats }` for the given numeric upload ids via the Upload
- * plugin's REST endpoint. Uses the same read-only NEXT_PUBLIC_STRAPI_TOKEN as
- * the GraphQL client (V4). Throws on a non-OK response so the caller's
- * fail-open catch keeps its existing behaviour.
+ * Fetch `{ id, formats, width, height }` for the given numeric upload ids via
+ * the Upload plugin's REST endpoint. Uses the same read-only
+ * NEXT_PUBLIC_STRAPI_TOKEN as the GraphQL client (V4). Throws on a non-OK
+ * response so the caller's fail-open catch keeps its existing behaviour.
+ *
+ * `width`/`height` are the ORIGINAL file's intrinsic dimensions, and they are
+ * requested here rather than derived downstream because they are the only
+ * honest source for an `<img width height>` pair: a theme that guessed them
+ * from CSS, from an aspect-ratio constant, or from the largest `formats`
+ * variant would emit a wrong intrinsic ratio, which is worse for layout
+ * stability than emitting nothing (the browser would reserve a box of the
+ * wrong shape and shift on load). They ride the SAME request as `formats` —
+ * two extra `fields[]` params, no additional round trip.
  */
-async function fetchUploadFileFormats(
+async function fetchUploadFileMeta(
   ids: number[]
-): Promise<UploadFileFormatsEntry[]> {
+): Promise<UploadFileMetaEntry[]> {
   if (!STRAPI_BASE_URL) return [];
 
   const params = new URLSearchParams();
   ids.forEach((id, i) => params.append(`filters[id][$in][${i}]`, String(id)));
   params.append("fields[0]", "id");
   params.append("fields[1]", "formats");
+  params.append("fields[2]", "width");
+  params.append("fields[3]", "height");
   params.append("pagination[pageSize]", String(Math.max(ids.length, 1)));
 
   const response = await fetch(
@@ -548,7 +668,7 @@ async function fetchUploadFileFormats(
   // The Upload plugin returns a bare array; tolerate a `{ data: [...] }`
   // envelope too so a future Strapi shape change degrades rather than throws.
   const rows = Array.isArray(body) ? body : body?.data;
-  return Array.isArray(rows) ? (rows as UploadFileFormatsEntry[]) : [];
+  return Array.isArray(rows) ? (rows as UploadFileMetaEntry[]) : [];
 }
 
 /**
@@ -706,16 +826,25 @@ export function collectImageIds(page: StrapiPage): number[] {
 }
 
 /**
- * Immutably merge resolved `formats` INTO each image-typed value's existing
- * `{id,url}` wrapper (value.formats) — writes ONLY `formats`, never touches
- * `id`/`url`. Walks the SAME shape collectImageIds walks (sections, blocks,
- * metafields). An id absent from `formatsById` is left completely UNCHANGED (no
- * `formats` key added, no throw) — this is the fail-open behavior for
+ * Immutably merge resolved upload metadata INTO each image-typed value's
+ * existing `{id,url}` wrapper — writes ONLY `formats`/`width`/`height`, never
+ * touches `id`/`url`. Walks the SAME shape collectImageIds walks (sections,
+ * blocks, metafields). An id absent from `metaById` is left completely
+ * UNCHANGED (no keys added, no throw) — this is the fail-open behavior for
  * deleted/stale file ids.
+ *
+ * `width`/`height` are the file's INTRINSIC dimensions and are merged
+ * alongside `formats` rather than in a second pass: a theme needs both to
+ * render one `<img>` (dimensions for the reserved box, formats for `srcset`),
+ * and splitting them across two traversals of this same nested shape is
+ * exactly the drift this module keeps collapsing into single seams. Each key
+ * is written only when the value is genuinely present, so an SVG or a file
+ * Strapi has no dimensions for gains no `width: undefined` key — a consumer
+ * can trust `"width" in value` as "Strapi knows this".
  */
 export function mergeImageFormats(
   page: StrapiPage,
-  formatsById: Map<number, unknown>
+  metaById: Map<number, UploadFileMeta>
 ): StrapiPage {
   function mergeValue(val: unknown): unknown {
     if (!isImageTypedValue(val)) return val;
@@ -724,16 +853,26 @@ export function mergeImageFormats(
         ? val.value
         : val.value?.id;
     const numericId = typeof raw === "string" ? Number(raw) : raw;
-    if (typeof numericId !== "number" || Number.isNaN(numericId) || !formatsById.has(numericId)) {
+    if (typeof numericId !== "number" || Number.isNaN(numericId) || !metaById.has(numericId)) {
       return val;
     }
     const existingValue =
       typeof val.value === "number" || typeof val.value === "string"
         ? { id: val.value }
         : val.value;
+    const meta = metaById.get(numericId) ?? {};
     return {
       ...val,
-      value: { ...existingValue, formats: formatsById.get(numericId) },
+      value: {
+        ...existingValue,
+        ...(meta.formats != null ? { formats: meta.formats } : {}),
+        ...(typeof meta.width === "number" && meta.width > 0
+          ? { width: meta.width }
+          : {}),
+        ...(typeof meta.height === "number" && meta.height > 0
+          ? { height: meta.height }
+          : {}),
+      },
     };
   }
 
@@ -769,7 +908,8 @@ export function mergeImageFormats(
 }
 
 /**
- * Resolve real Strapi `formats` onto every image field in a page, FRESH at READ
+ * Resolve real Strapi `formats` AND intrinsic `width`/`height` onto every image
+ * field in a page, FRESH at READ
  * time (D-01) — MUST NOT be persisted into the saved data JSON blob at customizer
  * save time (grep-confirmed: strapiAdapter.ts/puckAdapter.ts only ever write
  * `{id,url}`), so a later Strapi-side backfill (Plan 07) is picked up without any
@@ -777,20 +917,85 @@ export function mergeImageFormats(
  * image fields. Fails open on any network error (matches every other network call
  * in this file): logs via console.warn and returns the page UNCHANGED.
  */
+/**
+ * Rewrite every format variant's `url` to an ABSOLUTE CMS URL.
+ *
+ * Strapi's Upload plugin stores `formats[].url` relative to the CMS
+ * (`/uploads/large_x.jpg`), while the dashboard's adapter absolutizes only the
+ * TOP-LEVEL `url` it persists. A relative candidate inside a `srcset` resolves
+ * against the TENANT's origin, not the CMS — so every variant 404s, and
+ * because a browser selects from `srcset` and ignores `src` whenever `srcset`
+ * is present, the image fetches "fine" in DevTools and paints NOTHING.
+ *
+ * This is the same trap `resolveShareImage` documents for `og:image`
+ * (T-14-10): a Strapi media url composed against the tenant's own domain is a
+ * 404. It stayed invisible here only because `formats` never actually reached
+ * a component until the json-tagged-value fix landed — making the data flow
+ * exposed a latent bug rather than introducing one.
+ *
+ * Normalized HERE, at the single merge seam, rather than in `buildSrcSet`:
+ * every theme ships its own copy of that builder (they cannot import from this
+ * repo), so a fix there would have to land in N theme repos and would still
+ * leave any other `formats` consumer broken. One absolute-URL guarantee at the
+ * source covers all of them.
+ *
+ * An entry whose url is ALREADY absolute is left byte-identical (a cloud
+ * upload provider stores absolute urls, and re-prefixing would corrupt them).
+ * A non-object `formats`, a missing base, or an entry with no string url all
+ * degrade to passing the value through untouched — never throws.
+ */
+export function absolutizeFormatUrls(formats: unknown, baseUrl: string): unknown {
+  if (formats == null || typeof formats !== "object" || Array.isArray(formats)) {
+    return formats;
+  }
+  if (!baseUrl) return formats;
+
+  const base = baseUrl.replace(/\/+$/, "");
+  const result: Record<string, unknown> = {};
+
+  for (const [key, entry] of Object.entries(formats as Record<string, unknown>)) {
+    if (entry == null || typeof entry !== "object") {
+      result[key] = entry;
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const url = record.url;
+    if (typeof url !== "string" || url.trim() === "" || /^https?:\/\//.test(url)) {
+      result[key] = entry;
+      continue;
+    }
+    result[key] = { ...record, url: `${base}${url.startsWith("/") ? "" : "/"}${url}` };
+  }
+
+  return result;
+}
+
 export async function resolveImageFormats(page: StrapiPage): Promise<StrapiPage> {
   const ids = collectImageIds(page);
   if (ids.length === 0) return page;
 
   try {
-    const files = await fetchUploadFileFormats(ids);
-    const formatsById = new Map<number, unknown>();
+    const files = await fetchUploadFileMeta(ids);
+    const metaById = new Map<number, UploadFileMeta>();
     for (const file of files) {
-      if (file.formats == null) continue;
+      // An entry is kept when ANY of the three fields is usable. The previous
+      // `formats == null -> skip` rule would have dropped a file that has real
+      // dimensions but no resize variants — which is every SVG, and every
+      // raster small enough that Strapi generated no variants for it. Those
+      // are exactly the images a theme can dimension but not `srcset`.
       const numericId = typeof file.id === "number" ? file.id : Number(file.id);
       if (Number.isNaN(numericId)) continue;
-      formatsById.set(numericId, file.formats);
+      const meta: UploadFileMeta = {};
+      // Absolutized BEFORE it reaches any component — see absolutizeFormatUrls.
+      if (file.formats != null) {
+        meta.formats = absolutizeFormatUrls(file.formats, STRAPI_BASE_URL);
+      }
+      if (typeof file.width === "number") meta.width = file.width;
+      if (typeof file.height === "number") meta.height = file.height;
+      if (Object.keys(meta).length === 0) continue;
+      metaById.set(numericId, meta);
     }
-    return mergeImageFormats(page, formatsById);
+    return mergeImageFormats(page, metaById);
   } catch (error) {
     console.warn(
       "Failed to resolve image formats from Strapi:",
@@ -802,13 +1007,23 @@ export async function resolveImageFormats(page: StrapiPage): Promise<StrapiPage>
 
 /**
  * Fetch the Site singleton's liveTheme pointer (D-04). Returns the live theme's
- * documentId / name / builtAssetUrl, or null when unset (D-09 ambiguous tenant) or
- * unconfigured. Read-only path: uses the public NEXT_PUBLIC_STRAPI_TOKEN (V4).
+ * documentId / name / builtAssetUrl / sectionsManifest, or null when unset (D-09
+ * ambiguous tenant) or unconfigured. Read-only path: uses the public
+ * NEXT_PUBLIC_STRAPI_TOKEN (V4).
  *
  * Wrapped in React `cache()` so the multiple call sites that need this per request
  * (generateMetadata's fetchPageBySlug, Page()'s fetchPageBySlug, Page()'s explicit
  * resolveLiveBundle call) share ONE network round-trip instead of 3 — request-scoped
  * only, so "always fetch fresh data" across requests is unaffected.
+ *
+ * Phase 22 (BLOG-07): primary-then-fallback ladder mirroring `fetchPageBySlug`'s
+ * A2 ladder. `fetchSite` is on the critical path of EVERY page on the tenant, and
+ * Strapi fails the WHOLE document on one unknown field — an unguarded widening of
+ * `getSiteLiveThemeQuery` to select `liveTheme.sectionsManifest` would blank a
+ * tenant's entire site on any Theme schema that predates the field (the exact
+ * 2026-08-04 incident recorded above `getSiteLiveThemeQuery`). On a primary throw,
+ * retry once with the manifest-less `getSiteLiveThemeLegacyQuery`; only on a
+ * SECOND throw fall back to today's `console.error` + `return null`.
  */
 export const fetchSite = cache(async (): Promise<StrapiSite | null> => {
   if (!graphqlEndpoint) {
@@ -819,10 +1034,21 @@ export const fetchSite = cache(async (): Promise<StrapiSite | null> => {
   try {
     const response = await strapiClient.request<StrapiSiteResponse>(getSiteLiveThemeQuery);
     return response.site ?? null;
-  } catch (error) {
-    console.error("Failed to fetch site liveTheme from Strapi:", error);
-    // Build-time-safe: never throw, let callers fall back to env.
-    return null;
+  } catch (primaryError) {
+    console.warn(
+      "Manifest-bearing site query failed; falling back to GetSiteLiveThemeLegacy.",
+      primaryError instanceof Error ? primaryError.message : String(primaryError)
+    );
+    try {
+      const response = await strapiClient.request<StrapiSiteResponse>(
+        getSiteLiveThemeLegacyQuery
+      );
+      return response.site ?? null;
+    } catch (legacyError) {
+      console.error("Failed to fetch site liveTheme from Strapi:", legacyError);
+      // Build-time-safe: never throw, let callers fall back to env.
+      return null;
+    }
   }
 });
 

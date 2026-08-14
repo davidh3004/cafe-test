@@ -54,12 +54,17 @@ export interface RedirectRow {
   source: string;
   destination: string;
   redirectType?: string | null;
+  trackClicks?: boolean | null;
 }
 
 /** A resolved, emission-ready redirect rule. */
 export interface RedirectRule {
   destination: string;
   status: 301 | 302;
+  /** REQ-2: whether middleware should beacon a click for this rule. Always a
+   * real boolean on a built rule, never undefined, so the middleware never
+   * has to decide what an absent value means. */
+  trackClicks: boolean;
 }
 
 /** The built map, keyed by source. */
@@ -77,6 +82,31 @@ export function httpStatusForRedirectType(
   value: string | null | undefined
 ): 301 | 302 {
   return value === "temporary" ? 302 : 301;
+}
+
+/**
+ * REQ-2: the emitted status for a rule, with click tracking taken into
+ * account. A tracked redirect is ALWAYS 302, whatever `redirectType` says.
+ *
+ * This is not a preference, it is what makes the counter mean anything. A
+ * 301 is cached by the browser, so the second and every subsequent click by
+ * the same visitor never reaches this middleware and is never counted. The
+ * undercount is not random noise either — it scales with how loyal the
+ * audience is, so the more a link actually works, the more the number
+ * understates it. A counter that is wrong in proportion to success is worse
+ * than no counter.
+ *
+ * The dashboard makes the same substitution visible at authoring time by
+ * locking the type control while the toggle is on, so the stored
+ * `redirectType` and the emitted status can never silently disagree in a way
+ * the client cannot see. Turning tracking off restores the stored value —
+ * which is why this overrides rather than rewrites `redirectType`.
+ */
+export function httpStatusForRule(
+  redirectType: string | null | undefined,
+  trackClicks: boolean
+): 301 | 302 {
+  return trackClicks ? 302 : httpStatusForRedirectType(redirectType);
 }
 
 /**
@@ -121,10 +151,61 @@ export function isInternalDestination(destination: string): boolean {
 }
 
 /**
+ * The emission-side half of the external-destination allowance. Mirrors
+ * `lib/redirects/validate.ts`'s `isExternalDestination` exactly (mirror,
+ * don't import — see the module header); the two are pinned together by
+ * `__tests__/lib/redirect-pagination-cap.test.ts`.
+ *
+ * True only for an explicitly DECLARED `https://` URL. D-11 is NOT repealed
+ * by this function — it is narrowed. The open redirect D-11 closed was a
+ * destination that reads as an internal path and only becomes off-origin
+ * once the URL parser sees it (`//evil.com`, `/\evil.com`,
+ * `/<TAB>/evil.com`); every one of those is still rejected here and in
+ * `isInternalDestination`. What is newly permitted is the case where the
+ * author typed a full URL, saw it in the field, and meant it.
+ *
+ * Rejects any value carrying ASCII TAB/LF/CR outright (the internal guard
+ * strips-then-checks because a path may legitimately be typed with stray
+ * whitespace; an external URL may not, so the stored bytes can never differ
+ * from what the URL parser resolves), anything not literally prefixed
+ * `https://` — `http://` included, so a redirect off this site is never an
+ * insecure hop — anything unparseable or host-less, and anything carrying
+ * embedded credentials, whose real authority is the part after the `@`.
+ */
+export function isExternalDestination(destination: string): boolean {
+  if (/[\t\n\r]/.test(destination)) return false;
+  if (!/^https:\/\//i.test(destination)) return false;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(destination);
+  } catch {
+    return false;
+  }
+
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.hostname === "") return false;
+  if (parsed.username !== "" || parsed.password !== "") return false;
+
+  return true;
+}
+
+/**
+ * The union `buildRedirectMap` gates on. Kept as its own named export so the
+ * emission-side rule has exactly one name, and so the pin test can compare
+ * both trees' full verdicts rather than only their two halves.
+ */
+export function isAllowedDestination(destination: string): boolean {
+  return isInternalDestination(destination) || isExternalDestination(destination);
+}
+
+/**
  * Pure. Builds the request-time lookup map from raw Strapi rows. Trims each
  * row's source and destination; skips a row whose source or destination is
  * blank after trimming, whose source is reserved (T-16-02), or whose
- * destination is not internal (T-16-01). Assigns into a plain object keyed by
+ * destination is neither an internal path nor a declared `https://` URL
+ * (T-16-01, narrowed — see `isExternalDestination`). Assigns into a plain
+ * object keyed by
  * source, so a duplicate source deterministically resolves last-wins in
  * input order — no explicit ordering logic needed, later assignments simply
  * overwrite earlier ones. Never throws for a malformed row.
@@ -138,10 +219,12 @@ export function buildRedirectMap(rows: readonly RedirectRow[]): RedirectMap {
       typeof row.destination === "string" ? row.destination.trim() : "";
     if (source === "" || destination === "") continue;
     if (isReservedSource(source)) continue;
-    if (!isInternalDestination(destination)) continue;
+    if (!isAllowedDestination(destination)) continue;
+    const trackClicks = row.trackClicks === true;
     map[source] = {
       destination,
-      status: httpStatusForRedirectType(row.redirectType),
+      status: httpStatusForRule(row.redirectType, trackClicks),
+      trackClicks,
     };
   }
   return map;
@@ -168,6 +251,7 @@ const GET_REDIRECTS_QUERY = `
       source
       destination
       redirectType
+      trackClicks
     }
   }
 `;

@@ -40,6 +40,7 @@ import type { ResolvedSection } from "./section-resolver";
 import { reportSectionRenderFailure, reportSsrRuntimeUnavailable } from "./theme-evaluator";
 import type { LoadedThemeModule } from "./theme-loader";
 import type { StrapiPage } from "./strapi-client";
+import type { SectionRecordProps } from "./article-contract";
 // Namespace import (matches this repo's `import * as Sentry from
 // "@sentry/nextjs"` convention): a literal reference to the normalization
 // function's name below appears exactly once, at its one call site, since
@@ -168,8 +169,16 @@ export function buildShellHtml(args: {
   page: StrapiPage;
   themeModule: LoadedThemeModule;
   themeName: string;
+  /**
+   * Phase 21 (D-06/D-16): the resolved post/listing, threaded through the
+   * SAME shared seam (`resolveSectionsForRender`) the client tree
+   * (`lib/page-renderer.tsx`) uses, so the server string and the client tree
+   * can never carry different `article`/`archive` values. Optional and
+   * absent on every non-blog page composition today.
+   */
+  recordProps?: SectionRecordProps;
 }): string | null {
-  const { page, themeModule, themeName } = args;
+  const { page, themeModule, themeName, recordProps } = args;
 
   // Gate on the server-side React runtime BEFORE attempting any section, so a
   // platform-level breakage is reported once, under its own reason, with a
@@ -202,8 +211,11 @@ export function buildShellHtml(args: {
     // falling through to this function's own outer `catch` below, which can
     // only ever attribute a failure to the `SHELL_BUILDER_SECTION_KEY`
     // sentinel because it has no per-section granularity.
-    const resolved = resolveSectionsForRender(page, themeModule, (sectionKey, message) =>
-      reportSectionRenderFailure(themeName, sectionKey, message)
+    const resolved = resolveSectionsForRender(
+      page,
+      themeModule,
+      (sectionKey, message) => reportSectionRenderFailure(themeName, sectionKey, message),
+      recordProps
     );
     if (resolved.length === 0) {
       return null;

@@ -1,0 +1,32 @@
+{
+  // Type gate for the code that actually SHIPS to tenants.
+  //
+  // The root `tsconfig.json` excludes `templates` entirely, so until this file
+  // existed `yarn typecheck` never checked `templates/theme-site` — the tenant
+  // site template. The first thing to type-check it was the tenant's own
+  // `next build`, six minutes into a deploy. Two Phase 22/23 type errors
+  // reached production builds that way on 2026-08-13 before this was added.
+  //
+  // This config is the sibling of `tsconfig.json` with the TEST files removed.
+  // The tests are excluded deliberately and not as a convenience: they carry a
+  // body of pre-existing mock-typing errors (graphql-request's `RequestOptions`
+  // overload vs the two-arg `request(query, variables)` spy signature), none of
+  // which ship to a tenant. Gating on them would mean gating on nothing,
+  // because the gate would be red from the first day and get ignored. Source
+  // files are what a tenant runs, and source files are what this checks.
+  //
+  // If those test typings are ever cleaned up, delete the two `__tests__`
+  // exclusions below rather than adding a third config.
+  "extends": "./tsconfig.json",
+  "exclude": [
+    "node_modules",
+    "**/vite.config.ts",
+    "**/rollup.config.ts",
+    "**/webpack.config.ts",
+    "**/*.config.ts",
+    "theme-source/**",
+    "**/__tests__/**",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}

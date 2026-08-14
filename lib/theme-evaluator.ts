@@ -250,9 +250,121 @@ export function buildSandbox(
   const env = Object.freeze({ NODE_ENV: "production" });
   sandbox.process = Object.freeze({ env });
   sandbox.__THETA_THEMES__ = {};
+
+  // A MINIMAL DOM STUB — deliberately reverses D-05's original "omit document".
+  //
+  // Why the original decision could not hold. `sandbox.window = sandbox` below
+  // gives themes a defined `window`, but D-05 withheld `document`. No real
+  // environment is ever in that state, and it breaks the single most common
+  // idiom in browser code:
+  //
+  //     typeof window !== "undefined" && SomeLib.doBrowserThing()
+  //
+  // The guard passes because `window` exists, then the browser path runs
+  // against a missing `document`. theta-theme-fixocargo hit exactly this:
+  // DOMPurify without a `document` returns its degraded stub, which has no
+  // `addHook`, so the theme's module-scope
+  // `typeof window < "u" && DOMPurify.addHook(...)` threw. A module-scope throw
+  // fails the WHOLE bundle evaluation, so `evaluateThemeServerSide` returned
+  // null, no shell was built, and crawlers received an empty body. Confirmed in
+  // production: 0 <h1>/<h2>/<p>/<section> in 38 KB of served HTML. This is not
+  // theme-specific — any theme touching a browser-guarded library at module
+  // scope fails identically, which is why SSR had never worked for any tenant.
+  //
+  // Scope discipline. This is enough shape for browser libraries to initialise,
+  // NOT a usable DOM. There is no layout, no real tree, no events. Sections are
+  // rendered with `renderToStaticMarkup`, which needs none of that — so a theme
+  // that genuinely manipulates the DOM at module scope still degrades (per
+  // section, via reportSectionRenderFailure) rather than silently "working"
+  // against a fake document.
+  //
+  // SECURITY (Phase 12 threat model). Every value here is an inert local object
+  // — no Node built-in, no prototype chain out of the sandbox, no I/O. The
+  // deliberate omissions from D-05 that actually carry risk are UNCHANGED and
+  // still asserted by tests: no `localStorage`, `matchMedia`, `navigator`,
+  // `fetch`, or `require`. Element factories return a FRESH object per call so
+  // one section cannot stash state another section reads back.
+  const makeElement = (): Record<string, unknown> => ({
+    nodeType: 1,
+    tagName: "DIV",
+    style: {},
+    childNodes: [],
+    attributes: [],
+    setAttribute() {},
+    getAttribute() {
+      return null;
+    },
+    removeAttribute() {},
+    hasAttribute() {
+      return false;
+    },
+    appendChild() {},
+    removeChild() {},
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  });
+
+  const domGlobals: Record<string, unknown> = {
+    document: {
+      nodeType: 9,
+      createElement: makeElement,
+      createElementNS: makeElement,
+      createDocumentFragment: makeElement,
+      createTextNode: () => ({ nodeType: 3, textContent: "" }),
+      implementation: {
+        createHTMLDocument: () => ({
+          body: makeElement(),
+          head: makeElement(),
+          createElement: makeElement,
+        }),
+      },
+      get documentElement() {
+        return makeElement();
+      },
+      get body() {
+        return makeElement();
+      },
+      get head() {
+        return makeElement();
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+    },
+    // Constructors browser libraries feature-detect against (DOMPurify checks
+    // several of these before deciding it is usable). Inert placeholders.
+    Node: function Node() {},
+    Element: function Element() {},
+    HTMLTemplateElement: function HTMLTemplateElement() {},
+    DocumentFragment: function DocumentFragment() {},
+    NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
+  };
+
+  for (const key of Object.keys(domGlobals)) {
+    Object.defineProperty(sandbox, key, {
+      value: domGlobals[key],
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+
   // vm.createContext(sandbox) makes `sandbox` the context's global object,
   // so `sandbox.window = sandbox` gives `window === globalThis` inside the
-  // context -- exactly matching a real browser's invariant.
+  // context -- exactly matching a real browser's invariant. It also makes the
+  // stub above reachable as `window.document`, which is how most libraries
+  // reach for it.
   sandbox.window = sandbox;
 
   return sandbox;

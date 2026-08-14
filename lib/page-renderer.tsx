@@ -8,6 +8,7 @@ import {
   convertStrapiDataToProps as sharedConvertStrapiDataToProps,
   resolveSectionsForRender,
 } from "@/lib/section-resolver";
+import type { SectionRecordProps } from "@/lib/article-contract";
 // Namespace import (matches this repo's `import * as Sentry from
 // "@sentry/nextjs"` convention): a literal reference to the DOM
 // normalization function's name below appears exactly once, at its one call
@@ -46,6 +47,15 @@ interface PageRendererProps {
    * returned null) AND the D-04 kill-switch off-state.
    */
   shellHtml?: string;
+  /**
+   * Phase 21 (D-06/D-16): the resolved post/listing, forwarded to
+   * `resolveSectionsForRender` as its fourth argument -- the SAME optional
+   * record-prop parameter `lib/server-shell.tsx`'s `buildShellHtml` accepts,
+   * so a client-rendered `article-body` section receives the identical
+   * `article` object the server shell gave it. `undefined` on every current
+   * caller (Phase 22's post route is the first caller that will supply it).
+   */
+  recordProps?: SectionRecordProps;
 }
 
 /**
@@ -106,6 +116,7 @@ export function PageRenderer({
   themeCssUrl,
   themeCssDeferredUrl,
   shellHtml,
+  recordProps,
 }: PageRendererProps) {
   // Seed from the loader cache synchronously so an already-loaded theme (e.g. a
   // client-side navigation between pages) renders on the first paint with no flash.
@@ -349,10 +360,12 @@ export function PageRenderer({
   }
 
   // Resolve sections through the shared seam (@/lib/section-resolver) so the
-  // client tree and the server shell (lib/server-shell.tsx, added in a later
-  // task) can never drift: section-key resolution, prop conversion, and the
-  // orphan-section skip all live in exactly one place now.
-  const resolvedSections = resolveSectionsForRender(page, themeModule);
+  // client tree and the server shell (lib/server-shell.tsx) can never drift:
+  // section-key resolution, prop conversion, and the orphan-section skip all
+  // live in exactly one place now. `recordProps` (Phase 21, D-06/D-16) is
+  // forwarded as the fourth argument -- undefined on every current caller,
+  // so this call is unchanged for every existing page composition.
+  const resolvedSections = resolveSectionsForRender(page, themeModule, undefined, recordProps);
 
   return (
     <>

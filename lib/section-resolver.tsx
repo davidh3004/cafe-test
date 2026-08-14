@@ -18,6 +18,7 @@
 
 import type { LoadedThemeModule } from "./theme-loader";
 import type { StrapiPage, StrapiBlock, StrapiSection } from "./strapi-client";
+import type { SectionRecordProps } from "./article-contract";
 
 /** Normalize section key for lookup (lowercase, trim). */
 export function normalizeSectionKey(key: string): string {
@@ -268,11 +269,22 @@ export function sortSectionsForRender(page: StrapiPage): StrapiSection[] {
  * `PageRenderer`'s prior inline main-branch logic (D-02: the server string
  * and the client tree must be the same markup, guaranteed by calling one
  * shared function).
+ *
+ * `recordProps` (Phase 21, D-06/D-16) is a FOURTH, OPTIONAL, trailing
+ * parameter -- `article`/`archive` are spread into the returned prop bag
+ * only when each is present on it, so a caller passing nothing (every
+ * page-template caller, today) produces a prop bag byte-identical to before
+ * this parameter existed. This is the ONE seam both the server shell
+ * (`lib/server-shell.tsx`) and the client tree (`lib/page-renderer.tsx`)
+ * call, and -- once wired in 21-03 -- the customizer preview pipeline
+ * (`components/customizer/preview/render-pipeline.tsx`) too, since that is a
+ * structurally independent third caller of this same function.
  */
 export function buildSectionProps(
   section: StrapiSection,
   index: number,
-  themeModule: LoadedThemeModule
+  themeModule: LoadedThemeModule,
+  recordProps?: SectionRecordProps
 ): Record<string, unknown> {
   const props = convertStrapiDataToProps(section.data);
 
@@ -281,6 +293,16 @@ export function buildSectionProps(
     sectionId: section.id?.toString() || `${section.sectionKey}-${index}`,
     sectionName: section.sectionKey,
   };
+
+  if (recordProps?.article != null) {
+    componentProps.article = recordProps.article;
+  }
+  if (recordProps?.archive != null) {
+    componentProps.archive = recordProps.archive;
+  }
+  if (recordProps?.relatedPosts != null) {
+    componentProps.relatedPosts = recordProps.relatedPosts;
+  }
 
   const sortedBlocks = [...(section.blocks || [])].sort(
     (a, b) => (a.order ?? 0) - (b.order ?? 0)
@@ -350,11 +372,18 @@ export type SectionResolutionFailureReporter = (sectionKey: string, message: str
  *     one seam both the server shell and the client tree call), so a
  *     resolution-time failure can never diverge between the two render
  *     paths the way two separate try/catch blocks could.
+ *
+ * `recordProps` (Phase 21, D-06/D-16) is a fourth, optional, trailing
+ * parameter, placed AFTER `onResolutionFailure`, forwarded unchanged to
+ * every `buildSectionProps` call below -- so EVERY section in the
+ * composition receives the same `article`/`archive` object, not only
+ * whichever section happens to be the reserved body/list slot.
  */
 export function resolveSectionsForRender(
   page: StrapiPage,
   themeModule: LoadedThemeModule,
-  onResolutionFailure?: SectionResolutionFailureReporter
+  onResolutionFailure?: SectionResolutionFailureReporter,
+  recordProps?: SectionRecordProps
 ): ResolvedSection[] {
   const sortedSections = sortSectionsForRender(page);
   const resolved: ResolvedSection[] = [];
@@ -377,7 +406,7 @@ export function resolveSectionsForRender(
         index,
         keyForReact: section.id || index,
         Component,
-        props: buildSectionProps(section, index, themeModule),
+        props: buildSectionProps(section, index, themeModule, recordProps),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
